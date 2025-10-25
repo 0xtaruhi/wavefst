@@ -1,0 +1,51 @@
+[package]
+name = "wavefst"
+version = "0.1.0"
+edition = "2024"
+description = "Modern Rust implementation of the Fast Signal Trace (FST) binary waveform format."
+authors = ["Zhengyi Zhang <zhang_zhengyi@outlook.com>"]
+license-file = "LICENSE"
+repository = "https://github.com/0xtaruhi/wavefst"
+readme = "README.md"
+
+[features]
+default = ["gzip", "lz4", "mmap", "simd"]
+
+gzip = ["dep:flate2"]
+lz4 = ["dep:lz4_flex"]
+fastlz = ["dep:fastlz-sys"]
+parallel = ["dep:rayon"]
+serde = ["dep:serde"]
+mmap = ["dep:memmap2"]
+async = ["dep:tokio"]
+simd = []
+
+[dependencies]
+cfg-if = "1.0"
+thiserror = "1.0"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+smallvec = { version = "1.11", features = ["union"] }
+bytes = "1.6"
+num_enum = "0.7"
+clap = { version = "4.5", features = ["derive"] }
+
+flate2 = { version = "1", optional = true, default-features = false, features = ["zlib-rs"] }
+lz4_flex = { version = "0.11", optional = true }
+fastlz-sys = { version = "0.1", optional = true }
+memmap2 = { version = "0.9", optional = true }
+rayon = { version = "1.8", optional = true }
+serde = { version = "1.0", optional = true, features = ["derive"] }
+tokio = { version = "1.48.0", optional = true, features = ["fs", "io-util", "rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+anyhow = "1.0"
+criterion = "0.5"
+tempfile = "3.10"
+
+[[bench]]
+name = "reader"
+harness = false
+
+[[bench]]
+name = "writer"
+harness = false
