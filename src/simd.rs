@@ -35,8 +35,8 @@ unsafe fn pack_ascii_bits_x86_sse2(data: &[u8], packed_len: usize) -> Option<Vec
     let one = _mm_set1_epi8(b'1' as i8);
 
     while idx + 16 <= data.len() {
-        let ptr = data.as_ptr().add(idx) as *const __m128i;
-        let bytes = _mm_loadu_si128(ptr);
+        let ptr = unsafe { data.as_ptr().add(idx) as *const __m128i };
+        let bytes = unsafe { _mm_loadu_si128(ptr) };
         let is_zero = _mm_cmpeq_epi8(bytes, zero);
         let is_one = _mm_cmpeq_epi8(bytes, one);
         let valid = _mm_or_si128(is_zero, is_one);
