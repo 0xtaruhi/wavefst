@@ -21,7 +21,6 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-all-targets: true
           cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -41,7 +40,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-all-targets: true
           cache-on-failure: true
       - name: Cargo test
         run: cargo test --workspace --all-features
@@ -55,7 +53,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@beta
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-all-targets: true
           cache-on-failure: true
       - name: Cargo test
         run: cargo test --workspace --all-features
