@@ -26,6 +26,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rustdoc (all features)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps
+      - name: Verify release package
+        run: cargo package --locked
 
   test:
     name: Tests (stable)
@@ -56,3 +62,39 @@ jobs:
           cache-on-failure: true
       - name: Cargo test
         run: cargo test --workspace --all-features
+
+  libfst-interop:
+    name: Upstream libfst oracle
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install native codec dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
+      - name: Bidirectional libfst interoperability
+        run: scripts/test-libfst-interop.sh
+
+  feature-matrix:
+    name: Feature matrix
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features gzip"
+          - "--no-default-features --features lz4"
+          - "--no-default-features --features parallel"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Cargo test (${{ matrix.features }})
+        run: cargo test --workspace ${{ matrix.features }}

@@ -1,10 +1,9 @@
 #![doc = include_str!("../README.md")]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
 /// Block-level data structures mapping raw FST sections into typed records.
 pub mod block;
-/// Compression backends used for value-change and hierarchy payloads.
-pub mod compression;
 /// Encoding helpers such as variable-length integer codecs.
 pub mod encoding;
 /// Shared error and result types.
@@ -15,8 +14,7 @@ pub mod io;
 pub mod reader;
 /// Enumerations and value abstractions used across the crate.
 pub mod types;
-/// Miscellaneous helpers consumed by readers and writers.
-pub mod util;
+mod util;
 /// Streaming writer for constructing FST traces.
 pub mod writer;
 
@@ -30,12 +28,14 @@ mod simd;
 #[cfg(feature = "async")]
 pub use async_support::{AsyncReader, AsyncWriter, AsyncWriterBuilder, read_all as async_read_all};
 pub use block::{
-    BlackoutBlock, BlackoutEvent, GeomEntry, GeomInfo, Header, HierarchyBlock, ScopeEntry,
-    TimeSection, VarEntry, VcBlock,
+    BlackoutBlock, BlackoutEvent, GeomEntry, GeomInfo, Header, HierarchyBlock,
+    HierarchyCompression, ScopeEntry, TimeSection, VarEntry, VcBlock,
 };
-pub use compression::{Compressor, Decompressor, NullCompressor, NullDecompressor};
 pub use error::{Error, Result};
-pub use reader::{ChainIndex, ChainSlot, FstReader, ReaderBuilder, ReaderOptions, VcBlockMeta};
+pub use reader::{
+    ChainData, ChainIndex, ChainPayload, ChainSlot, FstReader, ReaderBuilder, ReaderOptions,
+    VcBlockMeta,
+};
 #[cfg(feature = "serde")]
 pub use serde_support::{
     AttributeNode, HierarchySnapshot, OwnedSignalValue, OwnedValueChange, ScopeNode, VariableNode,
@@ -43,6 +43,6 @@ pub use serde_support::{
 };
 pub use types::*;
 pub use writer::{
-    AttributeId, ChainCompression, FstWriter, ScopeId, TimeCompression, WriterBuilder,
-    WriterOptions,
+    AttributeId, ChainCompression, DynamicAliasEncoding, FstWriter, ScopeId,
+    SupplementalVariableMetadata, TimeCompression, WriterBuilder, WriterOptions,
 };

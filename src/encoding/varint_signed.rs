@@ -68,11 +68,27 @@ mod tests {
 
     #[test]
     fn round_trips_extremes() {
-        for value in [i64::MIN, i64::MAX, i32::MIN as i64, i32::MAX as i64] {
+        for value in [i64::MIN, i64::MAX, i64::from(i32::MIN), i64::from(i32::MAX)] {
             let mut encoded = Vec::new();
             encode_svarint(value, &mut encoded);
             let mut input = encoded.as_slice();
             assert_eq!(decode_svarint(&mut input).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn round_trips_deterministic_samples() {
+        let mut state = 0xd1b5_4a32_d192_ed03u64;
+        for _ in 0..10_000 {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            let value = state.cast_signed();
+            let mut encoded = Vec::new();
+            encode_svarint(value, &mut encoded);
+            let mut input = encoded.as_slice();
+            assert_eq!(decode_svarint(&mut input).unwrap(), value);
+            assert!(input.is_empty());
         }
     }
 }

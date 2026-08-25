@@ -1,5 +1,3 @@
-#![allow(missing_docs)]
-
 //! High-level streaming reader for FST files.
 
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -15,7 +13,7 @@ use crate::util::{read_u64_be, skip_bytes};
 
 mod vc;
 use vc::parse_vc_block;
-pub use vc::{ChainIndex, ChainSlot, VcBlockMeta};
+pub use vc::{ChainData, ChainIndex, ChainPayload, ChainSlot, VcBlockMeta};
 
 mod change;
 pub use change::{ValueChange, VcBlockChanges, build_changes};
@@ -45,6 +43,7 @@ impl Default for ReaderOptions {
 }
 
 /// Builder used to configure and construct a [`FstReader`].
+#[must_use]
 pub struct ReaderBuilder<R: ReadSeek> {
     source: R,
     options: ReaderOptions,
@@ -120,10 +119,11 @@ impl<R: ReadSeek> FstReader<R> {
             ReaderBackend::new(source)
         };
         let header = Header::read(backend.get_mut())?;
-        if header.max_handle > options.max_handles {
+        if header.max_handle > options.max_handles || header.max_handle > u64::from(u32::MAX) {
             return Err(Error::invalid(format!(
-                "header declares {} handles, above configured limit {}",
-                header.max_handle, options.max_handles
+                "header declares {} handles, above supported/configured limit {}",
+                header.max_handle,
+                options.max_handles.min(u64::from(u32::MAX))
             )));
         }
         let mut reader = Self {
@@ -213,52 +213,13 @@ impl<R: ReadSeek> FstReader<R> {
                         payload_len,
                         self.options.max_block_bytes,
                         self.options.max_handles,
+                        self.header.double_byte_order,
                     )?;
                     let block_end = section_start.checked_add(payload_len).ok_or_else(|| {
                         Error::invalid("value-change payload exceeds file bounds")
                     })?;
                     reader.seek(SeekFrom::Start(block_end))?;
                     return Ok(Some(meta));
-                }
-                BlockType::Geometry => {
-                    let section_length = read_u64_be(reader)?;
-                    validate_block_size(section_length, self.options.max_block_bytes)?;
-                    let payload_len = payload_length(section_length)?;
-                    if self.options.eager_geometry || self.geometry.is_none() {
-                        let geom = Self::read_geometry_block(
-                            reader,
-                            section_length,
-                            self.options.max_block_bytes,
-                            self.options.max_handles,
-                        )?;
-                        self.geometry = Some(geom);
-                    } else {
-                        skip_bytes(reader, payload_len)?;
-                    }
-                }
-                BlockType::Blackout => {
-                    let section_length = read_u64_be(reader)?;
-                    validate_block_size(section_length, self.options.max_block_bytes)?;
-                    let payload_len = payload_length(section_length)?;
-                    let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
-                        Error::invalid("blackout payload exceeds addressable memory")
-                    })?;
-                    let mut buf = vec![0u8; payload_len_usize];
-                    reader.read_exact(&mut buf)?;
-                    self.blackout = Some(BlackoutBlock::decode(&buf)?);
-                }
-                BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
-                    let hier = Self::read_hierarchy_block(
-                        reader,
-                        block_type,
-                        self.options.max_block_bytes,
-                    )?;
-                    self.hierarchy = Some(hier);
-                }
-                BlockType::Skip => {
-                    let section_length = read_u64_be(reader)?;
-                    let payload_len = payload_length(section_length)?;
-                    skip_bytes(reader, payload_len)?;
                 }
                 BlockType::ZWrapper => {
                     return Err(Error::invalid(
@@ -267,6 +228,11 @@ impl<R: ReadSeek> FstReader<R> {
                 }
                 BlockType::Header => {
                     return Err(Error::invalid("duplicate header block encountered"));
+                }
+                metadata => {
+                    if !self.consume_metadata_block(metadata)? {
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -289,60 +255,19 @@ impl<R: ReadSeek> FstReader<R> {
     }
 
     fn parse_preamble(&mut self) -> Result<()> {
-        let reader = self.backend.get_mut();
         loop {
+            let reader = self.backend.get_mut();
             let mut tag = [0u8; 1];
             match reader.read_exact(&mut tag) {
                 Ok(()) => {}
                 Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
                 Err(err) => return Err(err.into()),
             }
-            let block_type = match BlockType::try_from(tag[0]) {
-                Ok(bt) => bt,
-                Err(_) => return Err(Error::invalid(format!("unknown block type {:02x}", tag[0]))),
+            let Ok(block_type) = BlockType::try_from(tag[0]) else {
+                return Err(Error::invalid(format!("unknown block type {:02x}", tag[0])));
             };
 
             match block_type {
-                BlockType::Geometry => {
-                    let section_length = read_u64_be(reader)?;
-                    validate_block_size(section_length, self.options.max_block_bytes)?;
-                    let payload_len = payload_length(section_length)?;
-                    if self.options.eager_geometry || self.geometry.is_none() {
-                        let geom = Self::read_geometry_block(
-                            reader,
-                            section_length,
-                            self.options.max_block_bytes,
-                            self.options.max_handles,
-                        )?;
-                        self.geometry = Some(geom);
-                    } else {
-                        skip_bytes(reader, payload_len)?;
-                    }
-                }
-                BlockType::Blackout => {
-                    let section_length = read_u64_be(reader)?;
-                    validate_block_size(section_length, self.options.max_block_bytes)?;
-                    let payload_len = payload_length(section_length)?;
-                    let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
-                        Error::invalid("blackout payload exceeds addressable memory")
-                    })?;
-                    let mut buf = vec![0u8; payload_len_usize];
-                    reader.read_exact(&mut buf)?;
-                    self.blackout = Some(BlackoutBlock::decode(&buf)?);
-                }
-                BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
-                    let hier = Self::read_hierarchy_block(
-                        reader,
-                        block_type,
-                        self.options.max_block_bytes,
-                    )?;
-                    self.hierarchy = Some(hier);
-                }
-                BlockType::Skip => {
-                    let section_length = read_u64_be(reader)?;
-                    let payload_len = payload_length(section_length)?;
-                    skip_bytes(reader, payload_len)?;
-                }
                 BlockType::VcData | BlockType::VcDataDynAlias | BlockType::VcDataDynAlias2 => {
                     reader.seek(SeekFrom::Current(-1))?;
                     break;
@@ -354,6 +279,11 @@ impl<R: ReadSeek> FstReader<R> {
                 }
                 BlockType::Header => {
                     return Err(Error::invalid("duplicate header block encountered"));
+                }
+                metadata => {
+                    if !self.consume_metadata_block(metadata)? {
+                        break;
+                    }
                 }
             }
         }
@@ -380,41 +310,6 @@ impl<R: ReadSeek> FstReader<R> {
                     reader.seek(SeekFrom::Start(position))?;
                     return Ok(());
                 }
-                BlockType::Geometry => {
-                    let section_length = read_u64_be(reader)?;
-                    validate_block_size(section_length, self.options.max_block_bytes)?;
-                    let geom = Self::read_geometry_block(
-                        reader,
-                        section_length,
-                        self.options.max_block_bytes,
-                        self.options.max_handles,
-                    )?;
-                    self.geometry = Some(geom);
-                }
-                BlockType::Blackout => {
-                    let section_length = read_u64_be(reader)?;
-                    validate_block_size(section_length, self.options.max_block_bytes)?;
-                    let payload_len = payload_length(section_length)?;
-                    let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
-                        Error::invalid("blackout payload exceeds addressable memory")
-                    })?;
-                    let mut buf = vec![0u8; payload_len_usize];
-                    reader.read_exact(&mut buf)?;
-                    self.blackout = Some(BlackoutBlock::decode(&buf)?);
-                }
-                BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
-                    let hier = Self::read_hierarchy_block(
-                        reader,
-                        block_type,
-                        self.options.max_block_bytes,
-                    )?;
-                    self.hierarchy = Some(hier);
-                }
-                BlockType::Skip => {
-                    let section_length = read_u64_be(reader)?;
-                    let payload_len = payload_length(section_length)?;
-                    skip_bytes(reader, payload_len)?;
-                }
                 BlockType::ZWrapper => {
                     return Err(Error::invalid(
                         "z-wrapper must be the first and only outer block",
@@ -423,7 +318,62 @@ impl<R: ReadSeek> FstReader<R> {
                 BlockType::Header => {
                     return Err(Error::invalid("duplicate header block encountered"));
                 }
+                metadata => {
+                    if !self.consume_metadata_block(metadata)? {
+                        return Ok(());
+                    }
+                }
             }
+        }
+    }
+
+    /// Consumes a non-header, non-value-change block. Returns `false` for the libfst terminal
+    /// sentinel and `true` for ordinary metadata.
+    fn consume_metadata_block(&mut self, block_type: BlockType) -> Result<bool> {
+        let reader = self.backend.get_mut();
+        match block_type {
+            BlockType::Geometry => {
+                let section_length = read_u64_be(reader)?;
+                validate_block_size(section_length, self.options.max_block_bytes)?;
+                let payload_len = payload_length(section_length)?;
+                if self.options.eager_geometry || self.geometry.is_none() {
+                    self.geometry = Some(Self::read_geometry_block(
+                        reader,
+                        section_length,
+                        self.options.max_block_bytes,
+                        self.options.max_handles,
+                    )?);
+                } else {
+                    skip_bytes(reader, payload_len)?;
+                }
+                Ok(true)
+            }
+            BlockType::Blackout => {
+                let section_length = read_u64_be(reader)?;
+                validate_block_size(section_length, self.options.max_block_bytes)?;
+                let payload_len = payload_length(section_length)?;
+                let payload_len_usize = usize::try_from(payload_len)
+                    .map_err(|_| Error::invalid("blackout payload exceeds addressable memory"))?;
+                let mut payload = vec![0u8; payload_len_usize];
+                reader.read_exact(&mut payload)?;
+                self.blackout = Some(BlackoutBlock::decode(&payload)?);
+                Ok(true)
+            }
+            BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
+                self.hierarchy = Some(Self::read_hierarchy_block(
+                    reader,
+                    block_type,
+                    self.options.max_block_bytes,
+                )?);
+                Ok(true)
+            }
+            BlockType::Skip => {
+                // libfst uses this as an in-progress/end sentinel, including a zero-length
+                // placeholder in finalized empty traces. Nothing after it is another section.
+                reader.seek(SeekFrom::End(0))?;
+                Ok(false)
+            }
+            _ => Err(Error::invalid("expected an FST metadata block")),
         }
     }
 
@@ -440,9 +390,10 @@ impl<R: ReadSeek> FstReader<R> {
             ));
         }
         let max_handle = read_u64_be(reader)?;
-        if max_handle > max_handles {
+        if max_handle > max_handles || max_handle > u64::from(u32::MAX) {
             return Err(Error::invalid(format!(
-                "geometry declares {max_handle} handles, above configured limit {max_handles}"
+                "geometry declares {max_handle} handles, above supported/configured limit {}",
+                max_handles.min(u64::from(u32::MAX))
             )));
         }
         reader.seek(SeekFrom::Current(-16))?;

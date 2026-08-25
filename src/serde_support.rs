@@ -67,6 +67,9 @@ pub struct VariableNode {
     /// Optional bit-width when the signal has a fixed geometry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<u32>,
+    /// Raw stored width; VCD ports include strength/delimiter encoding overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_length: Option<u32>,
     /// Canonical handle assigned by the writer.
     pub handle: u32,
     /// Canonical handle that this variable aliases, when applicable.
@@ -139,9 +142,7 @@ impl OwnedValueChange {
 
 /// Collects *all* value changes from the iterator, returning an owned representation that can be
 /// serialized with `serde_json` or similar serializers.
-pub fn collect_value_changes<'a>(
-    changes: &mut VcBlockChanges<'a>,
-) -> Result<Vec<OwnedValueChange>> {
+pub fn collect_value_changes(changes: &mut VcBlockChanges<'_>) -> Result<Vec<OwnedValueChange>> {
     let mut out = Vec::new();
     for event in changes.by_ref() {
         let event = event?;
@@ -227,6 +228,7 @@ impl VariableNode {
             direction: entry.direction,
             name: entry.name.clone(),
             length: entry.length,
+            storage_length: entry.storage_length,
             handle: entry.handle,
             alias_of: entry.alias_of,
             is_alias: entry.is_alias,

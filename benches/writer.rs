@@ -8,6 +8,8 @@ use wavefst::{
 };
 
 const TOGGLE_COUNT: usize = 256;
+const DENSE_SIGNALS: usize = 512;
+const DENSE_STEPS: usize = 128;
 
 fn emit_sample_trace<W: wavefst::io::WriteSeek>(writer: &mut FstWriter<W>) {
     writer
@@ -90,6 +92,43 @@ fn emit_sample_trace<W: wavefst::io::WriteSeek>(writer: &mut FstWriter<W>) {
     }
 }
 
+fn emit_dense_binary_trace<W: wavefst::io::WriteSeek>(writer: &mut FstWriter<W>) {
+    writer
+        .begin_scope(ScopeType::VcdModule, "dense", None)
+        .expect("begin scope");
+    let handles: Vec<_> = (0..DENSE_SIGNALS)
+        .map(|signal| {
+            writer
+                .add_variable(
+                    VarType::VcdWire,
+                    VarDir::Implicit,
+                    format!("s{signal}"),
+                    GeomEntry::Fixed(1),
+                )
+                .expect("add bit")
+        })
+        .collect();
+    writer.end_scope().expect("end scope");
+    writer.write_header(Header::default()).expect("header");
+
+    let mut states: Vec<u64> = (1..=DENSE_SIGNALS)
+        .map(|signal| (signal as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .collect();
+    let mut batch: Vec<_> = handles.into_iter().map(|handle| (handle, false)).collect();
+    for step in 0..DENSE_STEPS {
+        for (signal, item) in batch.iter_mut().enumerate() {
+            let state = &mut states[signal];
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            item.1 = *state & 1 != 0;
+        }
+        writer
+            .emit_binary_batch(step as u64, &batch)
+            .expect("emit binary batch");
+    }
+}
+
 fn bench_writer(c: &mut Criterion) {
     #[allow(unused_mut, clippy::useless_vec)]
     let mut configs = vec![("raw", ChainCompression::Raw, TimeCompression::Raw)];
@@ -112,7 +151,7 @@ fn bench_writer(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("writer_emit_change");
-    for (label, chain, time) in configs {
+    for &(label, chain, time) in &configs {
         group.bench_with_input(
             BenchmarkId::from_parameter(label),
             &(chain, time),
@@ -127,6 +166,26 @@ fn bench_writer(c: &mut Criterion) {
                     emit_sample_trace(&mut writer);
                     let cursor = writer.finish().unwrap();
                     std::hint::black_box(cursor.into_inner())
+                });
+            },
+        );
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("writer_emit_binary_batch");
+    for &(label, chain, time) in &configs {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &(chain, time),
+            |b, &(chain, time)| {
+                b.iter(|| {
+                    let mut writer = FstWriter::builder(Cursor::new(Vec::new()))
+                        .chain_compression(chain)
+                        .time_compression(time)
+                        .build()
+                        .unwrap();
+                    emit_dense_binary_trace(&mut writer);
+                    std::hint::black_box(writer.finish().unwrap().into_inner())
                 });
             },
         );

@@ -8,7 +8,11 @@ use crate::block::{
 use crate::encoding::encode_varint;
 use crate::error::{Error, Result};
 use crate::io::{WriteSeek, WriterBackend};
-use crate::types::{BlockType, PackType, ScopeType, SignalValue, VarDir, VarType};
+use crate::types::{
+    AggregatePackType, ArrayAttributeType, BlockType, EnumValueType, FstByteOrder,
+    HierarchyAttributeType, MiscAttributeType, PackType, ScopeType, SignalValue,
+    SupplementalDataType, SupplementalVarType, VarDir, VarType,
+};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Seek, SeekFrom, Write};
@@ -29,6 +33,10 @@ pub struct WriterOptions {
     pub chain_compression: ChainCompression,
     /// Compression applied to the trailing time-table section.
     pub time_compression: TimeCompression,
+    /// Compression applied to the hierarchy declaration block.
+    pub hierarchy_compression: HierarchyCompression,
+    /// On-disk encoding used when equal signal chains are represented as dynamic aliases.
+    pub dynamic_alias_encoding: DynamicAliasEncoding,
     /// Wrap the entire file in an outer `FST_BL_ZWRAPPER` gzip envelope.
     pub wrap_zlib: bool,
     /// Maximum queued changes before the current value-change block is flushed.
@@ -59,6 +67,15 @@ pub enum TimeCompression {
     Zlib,
 }
 
+/// Encoding generation for value-change blocks containing dynamic aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicAliasEncoding {
+    /// Original `FST_BL_VCDATA_DYN_ALIAS` index encoding (block type 5).
+    Legacy,
+    /// Current compact signed index encoding (block type 8).
+    Compact,
+}
+
 impl Default for WriterOptions {
     fn default() -> Self {
         let chain_compression = if cfg!(feature = "gzip") {
@@ -71,11 +88,20 @@ impl Default for WriterOptions {
         } else {
             TimeCompression::Raw
         };
+        let hierarchy_compression = if cfg!(feature = "gzip") {
+            HierarchyCompression::Zlib { level: 4 }
+        } else if cfg!(feature = "lz4") {
+            HierarchyCompression::Lz4
+        } else {
+            HierarchyCompression::Raw
+        };
         Self {
             timescale_exponent: -9,
             compression_level: None,
             chain_compression,
             time_compression,
+            hierarchy_compression,
+            dynamic_alias_encoding: DynamicAliasEncoding::Compact,
             wrap_zlib: false,
             block_change_limit: 1_000_000,
             block_size_limit: 64 * 1024 * 1024,
@@ -84,6 +110,7 @@ impl Default for WriterOptions {
 }
 
 /// Builder for [`FstWriter`].
+#[must_use]
 pub struct WriterBuilder<W: WriteSeek> {
     sink: W,
     options: WriterOptions,
@@ -113,6 +140,18 @@ impl<W: WriteSeek> WriterBuilder<W> {
     /// Selects the compression strategy used for the block time table.
     pub fn time_compression(mut self, compression: TimeCompression) -> Self {
         self.options.time_compression = compression;
+        self
+    }
+
+    /// Selects compression for the hierarchy declaration block.
+    pub fn hierarchy_compression(mut self, compression: HierarchyCompression) -> Self {
+        self.options.hierarchy_compression = compression;
+        self
+    }
+
+    /// Chooses the legacy or current dynamic-alias index representation.
+    pub fn dynamic_alias_encoding(mut self, encoding: DynamicAliasEncoding) -> Self {
+        self.options.dynamic_alias_encoding = encoding;
         self
     }
 
@@ -158,64 +197,90 @@ fn validate_options(options: &WriterOptions) -> Result<()> {
             "writer block limits must be greater than zero",
         ));
     }
-    match options.chain_compression {
-        ChainCompression::Raw => {}
-        ChainCompression::Zlib => {
-            #[cfg(not(feature = "gzip"))]
-            {
-                return Err(Error::unsupported(
-                    "zlib chain compression requires the `gzip` feature",
-                ));
-            }
-        }
-        ChainCompression::Lz4 => {
-            #[cfg(not(feature = "lz4"))]
-            {
-                return Err(Error::unsupported(
-                    "lz4 chain compression requires the `lz4` feature",
-                ));
-            }
-        }
-        ChainCompression::FastLz => {
-            #[cfg(not(feature = "fastlz"))]
-            {
-                return Err(Error::unsupported(
-                    "fastlz chain compression requires the `fastlz` feature",
-                ));
-            }
-        }
-    }
 
-    match options.time_compression {
-        TimeCompression::Raw => {}
-        TimeCompression::Zlib => {
-            #[cfg(not(feature = "gzip"))]
-            {
-                return Err(Error::unsupported(
-                    "zlib time compression requires the `gzip` feature",
-                ));
-            }
-        }
-    }
-
-    if options.wrap_zlib {
-        #[cfg(not(feature = "gzip"))]
-        {
-            return Err(Error::unsupported(
-                "file-level zlib wrapper requires the `gzip` feature",
-            ));
-        }
+    #[cfg(not(any(feature = "gzip", feature = "lz4")))]
+    {
+        return Err(Error::unsupported(
+            "writing a self-contained FST requires the `gzip` or `lz4` feature for hierarchy data",
+        ));
     }
 
     #[cfg(any(feature = "gzip", feature = "lz4"))]
     {
+        match options.chain_compression {
+            ChainCompression::Raw => {}
+            ChainCompression::Zlib => {
+                #[cfg(not(feature = "gzip"))]
+                {
+                    return Err(Error::unsupported(
+                        "zlib chain compression requires the `gzip` feature",
+                    ));
+                }
+            }
+            ChainCompression::Lz4 => {
+                #[cfg(not(feature = "lz4"))]
+                {
+                    return Err(Error::unsupported(
+                        "lz4 chain compression requires the `lz4` feature",
+                    ));
+                }
+            }
+            ChainCompression::FastLz => {
+                #[cfg(not(feature = "fastlz"))]
+                {
+                    return Err(Error::unsupported(
+                        "fastlz chain compression requires the `fastlz` feature",
+                    ));
+                }
+            }
+        }
+
+        match options.time_compression {
+            TimeCompression::Raw => {}
+            TimeCompression::Zlib => {
+                #[cfg(not(feature = "gzip"))]
+                {
+                    return Err(Error::unsupported(
+                        "zlib time compression requires the `gzip` feature",
+                    ));
+                }
+            }
+        }
+
+        match options.hierarchy_compression {
+            HierarchyCompression::Raw => {
+                return Err(Error::unsupported(
+                    "libfst has no self-contained raw hierarchy block encoding",
+                ));
+            }
+            HierarchyCompression::Zlib { .. } => {
+                #[cfg(not(feature = "gzip"))]
+                {
+                    return Err(Error::unsupported(
+                        "zlib hierarchy compression requires the `gzip` feature",
+                    ));
+                }
+            }
+            HierarchyCompression::Lz4 | HierarchyCompression::Lz4Duo => {
+                #[cfg(not(feature = "lz4"))]
+                {
+                    return Err(Error::unsupported(
+                        "LZ4 hierarchy compression requires the `lz4` feature",
+                    ));
+                }
+            }
+        }
+
+        if options.wrap_zlib {
+            #[cfg(not(feature = "gzip"))]
+            {
+                return Err(Error::unsupported(
+                    "file-level zlib wrapper requires the `gzip` feature",
+                ));
+            }
+        }
+
         Ok(())
-    }
-    #[cfg(not(any(feature = "gzip", feature = "lz4")))]
-    {
-        Err(Error::unsupported(
-            "writing a self-contained FST requires the `gzip` or `lz4` feature for hierarchy data",
-        ))
     }
 }
 
@@ -336,7 +401,6 @@ pub struct FstWriter<W: WriteSeek> {
     output: OutputBackend<W>,
     options: WriterOptions,
     header_written: bool,
-    metadata_written: bool,
     frame_state: FrameState,
     scopes: Vec<ScopeEntry>,
     variables: Vec<VarEntry>,
@@ -346,6 +410,7 @@ pub struct FstWriter<W: WriteSeek> {
     scope_stack: Vec<usize>,
     geometry: Vec<GeomEntry>,
     next_handle: u32,
+    next_enum_handle: u32,
     header: Option<Header>,
     pending_chains: Vec<PendingChain>,
     pending_times: Vec<u64>,
@@ -356,7 +421,6 @@ pub struct FstWriter<W: WriteSeek> {
     first_change_time: Option<u64>,
     last_change_time: Option<u64>,
     blackout_events: Vec<BlackoutEvent>,
-    blackout_written: bool,
 }
 
 impl<W: WriteSeek> FstWriter<W> {
@@ -371,7 +435,6 @@ impl<W: WriteSeek> FstWriter<W> {
             output,
             options,
             header_written: false,
-            metadata_written: false,
             frame_state: FrameState::default(),
             scopes: Vec::new(),
             variables: Vec::new(),
@@ -381,6 +444,7 @@ impl<W: WriteSeek> FstWriter<W> {
             scope_stack: Vec::new(),
             geometry: Vec::new(),
             next_handle: 1,
+            next_enum_handle: 1,
             header: None,
             pending_chains: Vec::new(),
             pending_times: Vec::new(),
@@ -391,7 +455,6 @@ impl<W: WriteSeek> FstWriter<W> {
             first_change_time: None,
             last_change_time: None,
             blackout_events: Vec::new(),
-            blackout_written: false,
         })
     }
 
@@ -433,7 +496,6 @@ impl<W: WriteSeek> FstWriter<W> {
             .resize_with(self.geometry.len(), PendingChain::default);
 
         self.header_written = true;
-        self.metadata_written = true;
         self.header = Some(header);
         Ok(())
     }
@@ -498,6 +560,188 @@ impl<W: WriteSeek> FstWriter<W> {
         self.push_attribute(attr_type, subtype, name.into(), argument, true)
     }
 
+    /// Emits a self-contained hierarchy attribute whose name is an exact byte string.
+    ///
+    /// This is required for libfst source-stem attributes, which store a binary varint in the
+    /// otherwise textual name field.
+    pub fn add_attribute_bytes(
+        &mut self,
+        attr_type: u8,
+        subtype: u8,
+        name: impl Into<Vec<u8>>,
+        argument: u64,
+    ) -> Result<AttributeId> {
+        self.push_attribute_bytes(attr_type, subtype, name.into(), argument, false)
+    }
+
+    /// Begins a nested hierarchy attribute with an exact byte-string name.
+    pub fn begin_attribute_bytes(
+        &mut self,
+        attr_type: u8,
+        subtype: u8,
+        name: impl Into<Vec<u8>>,
+        argument: u64,
+    ) -> Result<AttributeId> {
+        self.push_attribute_bytes(attr_type, subtype, name.into(), argument, true)
+    }
+
+    /// Adds a typed, self-contained miscellaneous hierarchy attribute.
+    pub fn add_misc_attribute(
+        &mut self,
+        subtype: MiscAttributeType,
+        name: impl Into<String>,
+        argument: u64,
+    ) -> Result<AttributeId> {
+        self.add_attribute(
+            HierarchyAttributeType::Misc as u8,
+            subtype as u8,
+            name,
+            argument,
+        )
+    }
+
+    /// Begins a typed array attribute.
+    pub fn begin_array_attribute(
+        &mut self,
+        subtype: ArrayAttributeType,
+        name: impl Into<String>,
+        element_count: u64,
+    ) -> Result<AttributeId> {
+        self.begin_attribute(
+            HierarchyAttributeType::Array as u8,
+            subtype as u8,
+            name,
+            element_count,
+        )
+    }
+
+    /// Begins a typed enum attribute.
+    pub fn begin_enum_attribute(
+        &mut self,
+        subtype: EnumValueType,
+        name: impl Into<String>,
+        argument: u64,
+    ) -> Result<AttributeId> {
+        self.begin_attribute(
+            HierarchyAttributeType::Enum as u8,
+            subtype as u8,
+            name,
+            argument,
+        )
+    }
+
+    /// Begins a typed aggregate packing attribute.
+    pub fn begin_pack_attribute(
+        &mut self,
+        subtype: AggregatePackType,
+        name: impl Into<String>,
+        member_count: u64,
+    ) -> Result<AttributeId> {
+        self.begin_attribute(
+            HierarchyAttributeType::Pack as u8,
+            subtype as u8,
+            name,
+            member_count,
+        )
+    }
+
+    /// Adds a pathname-table entry used by source-stem attributes.
+    pub fn add_source_path(
+        &mut self,
+        path: impl Into<String>,
+        path_index: u64,
+    ) -> Result<AttributeId> {
+        if path_index == 0 {
+            return Err(Error::invalid(
+                "source path index must be greater than zero",
+            ));
+        }
+        self.add_misc_attribute(MiscAttributeType::Pathname, path, path_index)
+    }
+
+    /// Adds a source location referring to a previously declared pathname-table index.
+    pub fn add_source_stem(&mut self, path_index: u64, line: u64) -> Result<AttributeId> {
+        self.add_source_location(MiscAttributeType::SourceStem, path_index, line)
+    }
+
+    /// Adds an instantiation source location referring to a pathname-table index.
+    pub fn add_source_instantiation_stem(
+        &mut self,
+        path_index: u64,
+        line: u64,
+    ) -> Result<AttributeId> {
+        self.add_source_location(MiscAttributeType::SourceInstantiationStem, path_index, line)
+    }
+
+    /// Creates a libfst-compatible enum table and returns its 1-based table handle.
+    pub fn create_enum_table(
+        &mut self,
+        name: &str,
+        entries: &[(&str, &str)],
+        minimum_value_bits: usize,
+    ) -> Result<u32> {
+        self.ensure_metadata_mutable()?;
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte == 0)
+        {
+            return Err(Error::invalid(
+                "enum table name must be non-empty and contain no whitespace or NUL",
+            ));
+        }
+        if entries.is_empty() {
+            return Err(Error::invalid("enum table requires at least one entry"));
+        }
+        let handle = self.next_enum_handle;
+        self.next_enum_handle = self
+            .next_enum_handle
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid("enum table handle overflow"))?;
+
+        let mut encoded = format!("{name} {}", entries.len());
+        for (literal, _) in entries {
+            encoded.push(' ');
+            encoded.push_str(&escape_enum_field(literal.as_bytes()));
+        }
+        for (_, value) in entries {
+            encoded.push(' ');
+            if value.len() < minimum_value_bits {
+                encoded.extend(std::iter::repeat_n('0', minimum_value_bits - value.len()));
+            }
+            encoded.push_str(&escape_enum_field(value.as_bytes()));
+        }
+        self.add_misc_attribute(MiscAttributeType::EnumTable, encoded, u64::from(handle))?;
+        Ok(handle)
+    }
+
+    /// Associates the next variable declaration with an enum table handle.
+    pub fn add_enum_table_ref(&mut self, handle: u32) -> Result<AttributeId> {
+        if handle == 0 || handle >= self.next_enum_handle {
+            return Err(Error::invalid("enum table handle is not defined"));
+        }
+        self.add_misc_attribute(MiscAttributeType::EnumTable, "", u64::from(handle))
+    }
+
+    /// Declares a variable preceded by libfst `CreateVar2` supplemental metadata.
+    pub fn add_supplemental_variable(
+        &mut self,
+        var_type: VarType,
+        direction: VarDir,
+        name: impl Into<String>,
+        geometry: GeomEntry,
+        metadata: SupplementalVariableMetadata,
+    ) -> Result<u32> {
+        let argument = (u64::from(metadata.variable_type as u8) << 10)
+            | (u64::from(metadata.data_type as u16) & 0x3ff);
+        self.add_misc_attribute(
+            MiscAttributeType::SupplementalVariable,
+            metadata.type_description,
+            argument,
+        )?;
+        self.add_variable(var_type, direction, name, geometry)
+    }
+
     /// Closes the most recently begun hierarchy attribute.
     pub fn end_attribute(&mut self) -> Result<()> {
         self.ensure_metadata_mutable()?;
@@ -533,11 +777,12 @@ impl<W: WriteSeek> FstWriter<W> {
             .checked_add(1)
             .ok_or_else(|| Error::invalid("handle counter overflow"))?;
 
-        let length = match geometry {
-            GeomEntry::Fixed(bytes) => Some(bytes),
+        let storage_length = match geometry {
+            GeomEntry::Fixed(width) => Some(width),
             GeomEntry::Real => Some(8),
             GeomEntry::Variable => None,
         };
+        let length = logical_variable_length(var_type, storage_length)?;
 
         self.geometry.push(geometry);
         self.variables.push(VarEntry {
@@ -545,6 +790,7 @@ impl<W: WriteSeek> FstWriter<W> {
             direction,
             name,
             length,
+            storage_length,
             handle,
             alias_of: None,
             scope: Some(scope),
@@ -592,15 +838,17 @@ impl<W: WriteSeek> FstWriter<W> {
         })?;
         validate_geometry(var_type, &geometry)?;
 
+        let storage_length = match geometry {
+            GeomEntry::Fixed(width) => Some(width),
+            GeomEntry::Real => Some(8),
+            GeomEntry::Variable => None,
+        };
         self.variables.push(VarEntry {
             var_type,
             direction,
             name,
-            length: match geometry {
-                GeomEntry::Fixed(bytes) => Some(bytes),
-                GeomEntry::Real => Some(8),
-                GeomEntry::Variable => None,
-            },
+            length: logical_variable_length(var_type, storage_length)?,
+            storage_length,
             handle: target_handle,
             alias_of: Some(target_handle),
             scope: Some(scope),
@@ -644,7 +892,12 @@ impl<W: WriteSeek> FstWriter<W> {
             .geometry
             .get(geom_index)
             .ok_or_else(|| Error::invalid(format!("no geometry recorded for handle {handle}")))?;
-        let owned_value = Self::convert_value(value, geom_entry)?;
+        let double_byte_order = self
+            .header
+            .as_ref()
+            .ok_or_else(|| Error::invalid("header state missing after write"))?
+            .double_byte_order;
+        let owned_value = Self::convert_value(value, geom_entry, double_byte_order)?;
         let value_size = owned_value.memory_size();
 
         if self.pending_change_count != 0
@@ -678,7 +931,7 @@ impl<W: WriteSeek> FstWriter<W> {
             None => time_index,
         };
         let old_len = chain.data.len();
-        encode_owned_value(&owned_value, delta, &mut chain.data)?;
+        encode_owned_value(&owned_value, delta, double_byte_order, &mut chain.data)?;
         chain.last_time_index = Some(time_index);
         chain.latest_value = Some(owned_value);
         self.pending_bytes = self
@@ -697,15 +950,35 @@ impl<W: WriteSeek> FstWriter<W> {
         Ok(())
     }
 
+    /// Records a binary change through the single-bit fast path.
+    #[inline]
+    pub fn emit_binary_change(&mut self, timestamp: u64, handle: u32, value: bool) -> Result<()> {
+        self.validate_change_time(timestamp)?;
+        let geom_index = self.validate_binary_handle(handle)?;
+        self.queue_binary_change(timestamp, geom_index, value)
+    }
+
+    /// Records several binary changes at one timestamp while validating the timestamp once.
+    /// Handles are paired with their new boolean values in emission order.
+    #[inline]
+    pub fn emit_binary_batch(&mut self, timestamp: u64, changes: &[(u32, bool)]) -> Result<()> {
+        self.validate_change_time(timestamp)?;
+        for &(handle, _) in changes {
+            self.validate_binary_handle(handle)?;
+        }
+        for &(handle, value) in changes {
+            let geom_index = (handle - 1) as usize;
+            self.queue_binary_change(timestamp, geom_index, value)?;
+        }
+        Ok(())
+    }
+
     /// Records a `$dumpon`/`$dumpoff` transition for the blackout block.
     pub fn emit_dump_active(&mut self, timestamp: u64, is_on: bool) -> Result<()> {
         if !self.header_written {
             return Err(Error::invalid(
                 "dump activity cannot be emitted before the header is written",
             ));
-        }
-        if self.blackout_written {
-            return Err(Error::invalid("blackout block has already been finalized"));
         }
         if let Some(previous) = self.last_change_time
             && timestamp < previous
@@ -746,13 +1019,102 @@ impl<W: WriteSeek> FstWriter<W> {
     }
 
     fn ensure_metadata_mutable(&self) -> Result<()> {
-        if self.metadata_written {
+        if self.header_written {
             Err(Error::unsupported(
                 "metadata definitions must occur before writing the header",
             ))
         } else {
             Ok(())
         }
+    }
+
+    #[inline]
+    fn validate_change_time(&self, timestamp: u64) -> Result<()> {
+        if !self.header_written {
+            return Err(Error::invalid(
+                "value changes cannot be emitted before the header is written",
+            ));
+        }
+        if let Some(previous) = self.last_change_time
+            && timestamp < previous
+        {
+            return Err(Error::invalid(format!(
+                "timestamps must be monotonic: {timestamp} follows {previous}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_binary_handle(&self, handle: u32) -> Result<usize> {
+        if handle == 0 || handle >= self.next_handle {
+            return Err(Error::invalid(format!(
+                "handle {handle} is out of range (max {})",
+                self.next_handle - 1
+            )));
+        }
+        let geom_index = (handle - 1) as usize;
+        if self.geometry.get(geom_index) != Some(&GeomEntry::Fixed(1)) {
+            return Err(Error::invalid(format!(
+                "binary fast path requires single-bit geometry for handle {handle}"
+            )));
+        }
+        Ok(geom_index)
+    }
+
+    #[inline]
+    fn queue_binary_change(
+        &mut self,
+        timestamp: u64,
+        geom_index: usize,
+        value: bool,
+    ) -> Result<()> {
+        let value_size = std::mem::size_of::<OwnedValue>();
+        if self.pending_change_count != 0
+            && self.pending_bytes.saturating_add(value_size) > self.options.block_size_limit
+        {
+            self.flush_value_changes()?;
+        }
+
+        let time_index = if self.pending_times.last().copied() == Some(timestamp) {
+            self.pending_times.len() - 1
+        } else {
+            let delta = match self.pending_times.last().copied() {
+                Some(previous) => timestamp
+                    .checked_sub(previous)
+                    .ok_or_else(|| Error::invalid("timestamps must be non-decreasing"))?,
+                None => timestamp,
+            };
+            encode_varint(delta, &mut self.pending_time_data);
+            self.pending_times.push(timestamp);
+            self.pending_times.len() - 1
+        };
+
+        let chain = &mut self.pending_chains[geom_index];
+        let delta = match chain.last_time_index {
+            Some(previous) => time_index
+                .checked_sub(previous)
+                .ok_or_else(|| Error::invalid("time indices must be non-decreasing"))?,
+            None => time_index,
+        };
+        let bit = if value { BitValue::One } else { BitValue::Zero };
+        let old_len = chain.data.len();
+        encode_varint(bit.encode_marker(delta)?, &mut chain.data);
+        chain.last_time_index = Some(time_index);
+        chain.latest_value = Some(OwnedValue::Bit(bit));
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(chain.data.len().saturating_sub(old_len));
+        self.pending_change_count = self.pending_change_count.saturating_add(1);
+        self.first_change_time.get_or_insert(timestamp);
+        self.last_change_time = Some(timestamp);
+
+        if self.pending_change_count >= self.options.block_change_limit
+            || self.pending_bytes >= self.options.block_size_limit
+        {
+            self.flush_value_changes()?;
+        }
+        Ok(())
     }
 
     fn push_attribute(
@@ -763,12 +1125,29 @@ impl<W: WriteSeek> FstWriter<W> {
         argument: u64,
         nested: bool,
     ) -> Result<AttributeId> {
+        self.push_attribute_bytes(attr_type, subtype, name.into_bytes(), argument, nested)
+    }
+
+    fn push_attribute_bytes(
+        &mut self,
+        attr_type: u8,
+        subtype: u8,
+        raw_name: Vec<u8>,
+        argument: u64,
+        nested: bool,
+    ) -> Result<AttributeId> {
         self.ensure_metadata_mutable()?;
-        validate_hierarchy_text("attribute name", &name)?;
+        if raw_name.contains(&0) {
+            return Err(Error::invalid(
+                "attribute name contains an embedded NUL byte",
+            ));
+        }
+        let name = String::from_utf8_lossy(&raw_name).into_owned();
         let index = self.attributes.len();
         self.attributes.push(AttributeEntry {
             attr_type,
             subtype,
+            raw_name,
             name,
             argument,
             scope: self.scope_stack.last().copied(),
@@ -785,7 +1164,32 @@ impl<W: WriteSeek> FstWriter<W> {
         Ok(AttributeId(index))
     }
 
-    fn convert_value(value: SignalValue<'_>, geom: &GeomEntry) -> Result<OwnedValue> {
+    fn add_source_location(
+        &mut self,
+        subtype: MiscAttributeType,
+        path_index: u64,
+        line: u64,
+    ) -> Result<AttributeId> {
+        if path_index == 0 {
+            return Err(Error::invalid(
+                "source path index must be greater than zero",
+            ));
+        }
+        let mut encoded_index = Vec::new();
+        encode_varint(path_index, &mut encoded_index);
+        self.add_attribute_bytes(
+            HierarchyAttributeType::Misc as u8,
+            subtype as u8,
+            encoded_index,
+            line,
+        )
+    }
+
+    fn convert_value(
+        value: SignalValue<'_>,
+        geom: &GeomEntry,
+        double_byte_order: FstByteOrder,
+    ) -> Result<OwnedValue> {
         match geom {
             GeomEntry::Fixed(1) => match value {
                 SignalValue::Bit(bit) => Ok(OwnedValue::Bit(BitValue::from_char(bit)?)),
@@ -882,11 +1286,7 @@ impl<W: WriteSeek> FstWriter<W> {
                     }
                     let mut raw = [0u8; 8];
                     raw.copy_from_slice(&owned);
-                    let value = if cfg!(target_endian = "little") {
-                        f64::from_le_bytes(raw)
-                    } else {
-                        f64::from_be_bytes(raw)
-                    };
+                    let value = double_byte_order.decode_f64(raw);
                     Ok(OwnedValue::Real(value))
                 }
                 _ => Err(Error::unsupported(
@@ -918,7 +1318,7 @@ impl<W: WriteSeek> FstWriter<W> {
 
         for (handle_index, chain) in self.pending_chains.iter_mut().enumerate() {
             if let Some(value) = chain.latest_value.take() {
-                self.frame_state.update((handle_index + 1) as u32, &value)?;
+                self.frame_state.update((handle_index + 1) as u32, &value);
             }
             chain.data.clear();
             chain.last_time_index = None;
@@ -972,14 +1372,12 @@ impl<W: WriteSeek> FstWriter<W> {
     }
 
     fn write_blackout_block(&mut self) -> Result<()> {
-        if self.blackout_written || self.blackout_events.is_empty() {
+        if self.blackout_events.is_empty() {
             return Ok(());
         }
         let mut payload = Vec::new();
-        BlackoutBlock {
-            events: self.blackout_events.clone(),
-        }
-        .encode(&mut payload)?;
+        let events = std::mem::take(&mut self.blackout_events);
+        BlackoutBlock { events }.encode(&mut payload)?;
         let section_length = u64::try_from(payload.len())
             .map_err(|_| Error::invalid("blackout block exceeds supported length"))?
             .checked_add(8)
@@ -987,7 +1385,6 @@ impl<W: WriteSeek> FstWriter<W> {
         self.output.write_all(&[BlockType::Blackout as u8])?;
         self.output.write_all(&section_length.to_be_bytes())?;
         self.output.write_all(&payload)?;
-        self.blackout_written = true;
         Ok(())
     }
 
@@ -1005,9 +1402,14 @@ impl<W: WriteSeek> FstWriter<W> {
             ));
         }
 
-        let frame_bytes = self
-            .frame_state
-            .build_frame_bytes(&self.geometry, max_handle)?;
+        let frame_bytes = self.frame_state.build_frame_bytes(
+            &self.geometry,
+            max_handle,
+            self.header
+                .as_ref()
+                .ok_or_else(|| Error::invalid("header state missing after write"))?
+                .double_byte_order,
+        )?;
         let frame_encoding = encode_frame_section(frame_bytes, self.options.compression_level)?;
         let frame_max_handle = if frame_encoding.uncompressed_len > 0 {
             max_handle as u64
@@ -1094,10 +1496,9 @@ impl<W: WriteSeek> FstWriter<W> {
             }
         }
 
-        let index_bytes = if has_dynamic_aliases {
-            encode_chain_index_dyn_alias2(&index_entries)?
-        } else {
-            encode_chain_index(&index_entries)?
+        let index_bytes = match (has_dynamic_aliases, self.options.dynamic_alias_encoding) {
+            (true, DynamicAliasEncoding::Compact) => encode_chain_index_dyn_alias2(&index_entries)?,
+            _ => encode_chain_index(&index_entries)?,
         };
         let index_length = u64::try_from(index_bytes.len())
             .map_err(|_| Error::invalid("index length exceeds supported range"))?;
@@ -1139,10 +1540,10 @@ impl<W: WriteSeek> FstWriter<W> {
         payload.extend_from_slice(&time_encoding.compressed_len.to_be_bytes());
         payload.extend_from_slice(&time_encoding.item_count.to_be_bytes());
 
-        let block_type = if has_dynamic_aliases {
-            BlockType::VcDataDynAlias2
-        } else {
-            BlockType::VcData
+        let block_type = match (has_dynamic_aliases, self.options.dynamic_alias_encoding) {
+            (true, DynamicAliasEncoding::Legacy) => BlockType::VcDataDynAlias,
+            (true, DynamicAliasEncoding::Compact) => BlockType::VcDataDynAlias2,
+            (false, _) => BlockType::VcData,
         };
         Ok((block_type, payload))
     }
@@ -1153,7 +1554,8 @@ impl<W: WriteSeek> FstWriter<W> {
             .write_all(&header.section_length.to_be_bytes())?;
         self.output.write_all(&header.start_time.to_be_bytes())?;
         self.output.write_all(&header.end_time.to_be_bytes())?;
-        self.output.write_all(&std::f64::consts::E.to_ne_bytes())?;
+        self.output
+            .write_all(&header.double_byte_order.encode_f64(std::f64::consts::E))?;
         self.output.write_all(&header.memory_used.to_be_bytes())?;
         self.output.write_all(&header.scope_count.to_be_bytes())?;
         self.output.write_all(&header.var_count.to_be_bytes())?;
@@ -1194,14 +1596,12 @@ impl<W: WriteSeek> FstWriter<W> {
             variables: self.variables.clone(),
             attributes: self.attributes.clone(),
         };
-        #[cfg(feature = "gzip")]
-        let compression = HierarchyCompression::Zlib {
-            level: self.options.compression_level.unwrap_or(4).min(9),
+        let compression = match self.options.hierarchy_compression {
+            HierarchyCompression::Zlib { level } => HierarchyCompression::Zlib {
+                level: self.options.compression_level.unwrap_or(level).min(9),
+            },
+            other => other,
         };
-        #[cfg(all(not(feature = "gzip"), feature = "lz4"))]
-        let compression = HierarchyCompression::Lz4;
-        #[cfg(not(any(feature = "lz4", feature = "gzip")))]
-        let compression = HierarchyCompression::Raw;
         let encoded = block.encode_block(compression)?;
         self.output.write_all(&[encoded.block_type as u8])?;
         self.output.with_writer(|writer| encoded.write_to(writer))?;
@@ -1212,8 +1612,7 @@ impl<W: WriteSeek> FstWriter<W> {
         match self.options.chain_compression {
             // libfst has no raw marker. A 'Z' marker with stored_len=0 chains is the canonical
             // representation for uncompressed chains and needs no zlib decoder.
-            ChainCompression::Raw => PackType::Zlib,
-            ChainCompression::Zlib => PackType::Zlib,
+            ChainCompression::Raw | ChainCompression::Zlib => PackType::Zlib,
             ChainCompression::Lz4 => PackType::Lz4,
             ChainCompression::FastLz => PackType::FastLz,
         }
@@ -1225,6 +1624,33 @@ fn write_cstring(buf: &mut [u8], value: &str) {
     let len = bytes.len().min(buf.len().saturating_sub(1));
     buf[..len].copy_from_slice(&bytes[..len]);
     buf[len] = 0;
+}
+
+fn escape_enum_field(bytes: &[u8]) -> String {
+    let mut escaped = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'\x07' => escaped.push_str("\\a"),
+            b'\x08' => escaped.push_str("\\b"),
+            b'\x0c' => escaped.push_str("\\f"),
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            b'\x0b' => escaped.push_str("\\v"),
+            b'\'' => escaped.push_str("\\'"),
+            b'"' => escaped.push_str("\\\""),
+            b'\\' => escaped.push_str("\\\\"),
+            b'?' => escaped.push_str("\\?"),
+            b'!'..=b'~' => escaped.push(char::from(byte)),
+            _ => {
+                escaped.push('\\');
+                escaped.push(char::from(b'0' + byte / 64));
+                escaped.push(char::from(b'0' + (byte & 63) / 8));
+                escaped.push(char::from(b'0' + (byte & 7)));
+            }
+        }
+    }
+    escaped
 }
 
 fn validate_hierarchy_text(field: &str, value: &str) -> Result<()> {
@@ -1257,7 +1683,30 @@ fn validate_geometry(var_type: VarType, geometry: &GeomEntry) -> Result<()> {
             "variable type {var_type:?} and geometry {geometry:?} disagree about variable-length encoding"
         )));
     }
+    if var_type == VarType::VcdPort {
+        let GeomEntry::Fixed(storage_length) = geometry else {
+            return Err(Error::invalid("VCD ports require fixed geometry"));
+        };
+        logical_variable_length(var_type, Some(*storage_length))?;
+    }
     Ok(())
+}
+
+fn logical_variable_length(var_type: VarType, storage_length: Option<u32>) -> Result<Option<u32>> {
+    if var_type != VarType::VcdPort {
+        return Ok(storage_length);
+    }
+    let storage_length =
+        storage_length.ok_or_else(|| Error::invalid("VCD port storage length is missing"))?;
+    let payload = storage_length
+        .checked_sub(2)
+        .ok_or_else(|| Error::invalid("VCD port storage length must be at least 2"))?;
+    if payload % 3 != 0 {
+        return Err(Error::invalid(
+            "VCD port storage length must equal 3 * logical width + 2",
+        ));
+    }
+    Ok(Some(payload / 3))
 }
 
 /// Identifier returned when opening a scope.
@@ -1267,6 +1716,32 @@ pub struct ScopeId(pub usize);
 /// Identifier returned when adding a hierarchy attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AttributeId(pub usize);
+
+/// Extra HDL type information encoded by libfst's `CreateVar2` hierarchy attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupplementalVariableMetadata {
+    /// Optional language-specific or custom type description.
+    pub type_description: String,
+    /// HDL object kind, such as a VHDL signal or constant.
+    pub variable_type: SupplementalVarType,
+    /// HDL data type, such as `std_logic` or `integer`.
+    pub data_type: SupplementalDataType,
+}
+
+impl SupplementalVariableMetadata {
+    /// Creates supplemental hierarchy metadata for a variable declaration.
+    pub fn new(
+        type_description: impl Into<String>,
+        variable_type: SupplementalVarType,
+        data_type: SupplementalDataType,
+    ) -> Self {
+        Self {
+            type_description: type_description.into(),
+            variable_type,
+            data_type,
+        }
+    }
+}
 
 const SPECIAL_BIT_CHARS: [u8; 8] = *b"xzhuwl-?";
 
@@ -1336,9 +1811,7 @@ impl FrameState {
             self.entries.resize(idx, None);
         }
         match geom {
-            GeomEntry::Fixed(1) => {
-                // default uninitialised bit left as None; frame builder will emit 'x'.
-            }
+            GeomEntry::Fixed(1) | GeomEntry::Variable => {}
             GeomEntry::Fixed(len) => {
                 let len_usize = *len as usize;
                 if let Some(slot) = self.entries.get_mut(idx - 1) {
@@ -1350,13 +1823,10 @@ impl FrameState {
                     slot.get_or_insert_with(|| FrameValue::Real(f64::NAN));
                 }
             }
-            GeomEntry::Variable => {
-                // Variable-length signals are not represented in the initial frame.
-            }
-        };
+        }
     }
 
-    fn update(&mut self, handle: u32, value: &OwnedValue) -> Result<()> {
+    fn update(&mut self, handle: u32, value: &OwnedValue) {
         let idx = handle as usize;
         if self.entries.len() < idx {
             self.entries.resize(idx, None);
@@ -1376,10 +1846,14 @@ impl FrameState {
                 // Variable-length signals do not participate in the initial frame.
             }
         }
-        Ok(())
     }
 
-    fn build_frame_bytes(&self, geometry: &[GeomEntry], max_handle: u32) -> Result<Vec<u8>> {
+    fn build_frame_bytes(
+        &self,
+        geometry: &[GeomEntry],
+        max_handle: u32,
+        double_byte_order: FstByteOrder,
+    ) -> Result<Vec<u8>> {
         if max_handle == 0 {
             return Ok(Vec::new());
         }
@@ -1425,11 +1899,7 @@ impl FrameState {
                         .and_then(|opt| opt.as_ref())
                         .and_then(FrameValue::as_real)
                         .unwrap_or(f64::NAN);
-                    let bytes = if cfg!(target_endian = "little") {
-                        value.to_le_bytes()
-                    } else {
-                        value.to_be_bytes()
-                    };
+                    let bytes = double_byte_order.encode_f64(value);
                     buf.extend_from_slice(&bytes);
                 }
                 GeomEntry::Variable => {
@@ -1452,8 +1922,7 @@ impl FrameValue {
     fn as_bit_char(&self) -> char {
         match self {
             FrameValue::Bit(bit) => bit.to_char(),
-            FrameValue::Vector(_) => 'x',
-            FrameValue::Real(_) => 'x',
+            FrameValue::Vector(_) | FrameValue::Real(_) => 'x',
         }
     }
 
@@ -1496,7 +1965,12 @@ impl OwnedValue {
     }
 }
 
-fn encode_owned_value(value: &OwnedValue, delta: usize, output: &mut Vec<u8>) -> Result<()> {
+fn encode_owned_value(
+    value: &OwnedValue,
+    delta: usize,
+    double_byte_order: FstByteOrder,
+    output: &mut Vec<u8>,
+) -> Result<()> {
     match value {
         OwnedValue::Bit(bit) => {
             encode_varint(bit.encode_marker(delta)?, output);
@@ -1528,11 +2002,7 @@ fn encode_owned_value(value: &OwnedValue, delta: usize, output: &mut Vec<u8>) ->
             let delta =
                 u64::try_from(delta).map_err(|_| Error::invalid("time delta exceeds u64 range"))?;
             encode_varint((delta << 1) | 1, output);
-            let bytes = if cfg!(target_endian = "little") {
-                value.to_le_bytes()
-            } else {
-                value.to_be_bytes()
-            };
+            let bytes = double_byte_order.encode_f64(*value);
             output.extend_from_slice(&bytes);
         }
         OwnedValue::VarLen(bytes) => {
@@ -1553,7 +2023,7 @@ fn pack_ascii_bits(data: &[u8], width: u32) -> Option<Vec<u8>> {
 
     #[cfg(feature = "simd")]
     {
-        if let Some(result) = crate::simd::pack_ascii_bits(data, width, len) {
+        if let Some(result) = crate::simd::pack_ascii_bits(data, len) {
             return Some(result);
         }
     }

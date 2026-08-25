@@ -526,11 +526,13 @@ fn fastlz_compress_bytes(input: &[u8]) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::invalid("fastlz scratch size overflow"))?;
     let capacity = scratch.max(66);
     let mut output = vec![0u8; capacity];
+    // SAFETY: both pointers are valid for the lengths passed to FastLZ. `capacity` follows the
+    // upstream worst-case formula, and the returned length is checked before truncating.
     let written = unsafe {
         fastlz_compress(
-            input.as_ptr() as *const c_void,
+            input.as_ptr().cast::<c_void>(),
             input_len,
-            output.as_mut_ptr() as *mut c_void,
+            output.as_mut_ptr().cast::<c_void>(),
         )
     };
     if written <= 0 {

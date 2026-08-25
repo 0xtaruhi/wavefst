@@ -1,4 +1,7 @@
-#![allow(missing_docs)]
+#![allow(
+    missing_docs,
+    reason = "wire enum variants intentionally retain the self-describing upstream libfst names"
+)]
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
@@ -67,6 +70,44 @@ pub enum FileType {
     Mixed = 2,
 }
 
+/// Byte order used for native IEEE-754 values in an FST stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum FstByteOrder {
+    LittleEndian,
+    BigEndian,
+}
+
+impl FstByteOrder {
+    /// Returns the byte order of the current target.
+    #[must_use]
+    pub const fn native() -> Self {
+        if cfg!(target_endian = "little") {
+            Self::LittleEndian
+        } else {
+            Self::BigEndian
+        }
+    }
+
+    /// Encodes an IEEE-754 value in this byte order.
+    #[must_use]
+    pub fn encode_f64(self, value: f64) -> [u8; 8] {
+        match self {
+            Self::LittleEndian => value.to_le_bytes(),
+            Self::BigEndian => value.to_be_bytes(),
+        }
+    }
+
+    /// Decodes an IEEE-754 value in this byte order.
+    #[must_use]
+    pub fn decode_f64(self, bytes: [u8; 8]) -> f64 {
+        match self {
+            Self::LittleEndian => f64::from_le_bytes(bytes),
+            Self::BigEndian => f64::from_be_bytes(bytes),
+        }
+    }
+}
+
 /// All supported variable kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -117,6 +158,115 @@ pub enum VarDir {
     Linkage = 5,
 }
 
+/// Top-level hierarchy attribute category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum HierarchyAttributeType {
+    Misc = 0,
+    Array = 1,
+    Enum = 2,
+    Pack = 3,
+}
+
+/// Subtypes for [`HierarchyAttributeType::Misc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum MiscAttributeType {
+    Comment = 0,
+    EnvironmentVariable = 1,
+    SupplementalVariable = 2,
+    Pathname = 3,
+    SourceStem = 4,
+    SourceInstantiationStem = 5,
+    ValueList = 6,
+    EnumTable = 7,
+    Unknown = 8,
+}
+
+/// Subtypes for [`HierarchyAttributeType::Array`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum ArrayAttributeType {
+    None = 0,
+    Unpacked = 1,
+    Packed = 2,
+    Sparse = 3,
+}
+
+/// Subtypes for [`HierarchyAttributeType::Enum`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum EnumValueType {
+    SvInteger = 0,
+    SvBit = 1,
+    SvLogic = 2,
+    SvInt = 3,
+    SvShortInt = 4,
+    SvLongInt = 5,
+    SvByte = 6,
+    SvUnsignedInteger = 7,
+    SvUnsignedBit = 8,
+    SvUnsignedLogic = 9,
+    SvUnsignedInt = 10,
+    SvUnsignedShortInt = 11,
+    SvUnsignedLongInt = 12,
+    SvUnsignedByte = 13,
+    Reg = 14,
+    Time = 15,
+}
+
+/// Subtypes for [`HierarchyAttributeType::Pack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum AggregatePackType {
+    None = 0,
+    Unpacked = 1,
+    Packed = 2,
+    TaggedPacked = 3,
+}
+
+/// Supplemental HDL object kind encoded by libfst `CreateVar2` metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum SupplementalVarType {
+    None = 0,
+    VhdlSignal = 1,
+    VhdlVariable = 2,
+    VhdlConstant = 3,
+    VhdlFile = 4,
+    VhdlMemory = 5,
+}
+
+/// Supplemental HDL data type encoded by libfst `CreateVar2` metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u16)]
+pub enum SupplementalDataType {
+    None = 0,
+    VhdlBoolean = 1,
+    VhdlBit = 2,
+    VhdlBitVector = 3,
+    VhdlStdUlogic = 4,
+    VhdlStdUlogicVector = 5,
+    VhdlStdLogic = 6,
+    VhdlStdLogicVector = 7,
+    VhdlUnsigned = 8,
+    VhdlSigned = 9,
+    VhdlInteger = 10,
+    VhdlReal = 11,
+    VhdlNatural = 12,
+    VhdlPositive = 13,
+    VhdlTime = 14,
+    VhdlCharacter = 15,
+    VhdlString = 16,
+}
+
 /// Compression marker used inside value-change blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -129,6 +279,7 @@ pub enum PackType {
 
 impl PackType {
     /// Converts the on-disk marker (single byte) into a [`PackType`].
+    #[must_use]
     pub fn from_marker(marker: u8) -> Option<Self> {
         match marker {
             b'Z' | b'!' | b'^' => Some(Self::Zlib),
@@ -140,6 +291,7 @@ impl PackType {
     }
 
     /// Returns the marker byte used in value-change blocks.
+    #[must_use]
     pub fn marker(self) -> u8 {
         match self {
             Self::None => 0,

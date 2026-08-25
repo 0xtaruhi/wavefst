@@ -1,5 +1,3 @@
-#![allow(missing_docs)]
-
 use std::io::{Read, Write};
 
 #[cfg(feature = "gzip")]
@@ -19,51 +17,114 @@ use crate::util::read_u64_be;
 /// Fully decoded hierarchy block retaining the original token ordering.
 #[derive(Debug, Clone, Default)]
 pub struct HierarchyBlock {
+    /// Declaration tokens in their exact original order.
     pub items: Vec<HierarchyItem>,
+    /// Parsed scope declarations referenced by [`HierarchyItem::ScopeBegin`].
     pub scopes: Vec<ScopeEntry>,
+    /// Parsed variable declarations referenced by [`HierarchyItem::Var`].
     pub variables: Vec<VarEntry>,
+    /// Parsed attribute declarations referenced by [`HierarchyItem::AttributeBegin`].
     pub attributes: Vec<AttributeEntry>,
 }
 
 /// Ordered representation of the hierarchy token stream.
 #[derive(Debug, Clone)]
 pub enum HierarchyItem {
-    ScopeBegin { scope_index: usize },
+    /// Opens the referenced scope.
+    ScopeBegin {
+        /// Index into [`HierarchyBlock::scopes`].
+        scope_index: usize,
+    },
+    /// Closes the current scope.
     ScopeEnd,
-    AttributeBegin { attribute_index: usize },
+    /// Opens the referenced generic attribute.
+    AttributeBegin {
+        /// Index into [`HierarchyBlock::attributes`].
+        attribute_index: usize,
+    },
+    /// Closes the current generic attribute.
     AttributeEnd,
-    Var { var_index: usize },
+    /// Declares the referenced variable.
+    Var {
+        /// Index into [`HierarchyBlock::variables`].
+        var_index: usize,
+    },
 }
 
 /// Describes a scope (module, architecture, etc.).
 #[derive(Debug, Clone)]
 pub struct ScopeEntry {
+    /// FST scope kind.
     pub scope_type: ScopeType,
+    /// Local scope name.
     pub name: String,
+    /// Optional component/type name supplied by the producer.
     pub component: Option<String>,
+    /// Parent scope index, or `None` for a root scope.
     pub parent: Option<usize>,
 }
 
 /// Attribute metadata emitted inside the hierarchy stream.
 #[derive(Debug, Clone)]
 pub struct AttributeEntry {
+    /// Raw `fstAttrType` code.
     pub attr_type: u8,
+    /// Raw subtype code interpreted according to [`Self::attr_type`].
     pub subtype: u8,
+    /// Lossy UTF-8 view of the attribute name. Most attributes are textual.
     pub name: String,
+    /// Exact bytes stored before the terminating NUL. Source-stem attributes use a binary varint
+    /// pathname-table index here and are not necessarily UTF-8.
+    pub raw_name: Vec<u8>,
+    /// Numeric argument associated with the attribute record.
     pub argument: u64,
+    /// Scope index active when the attribute was declared.
     pub scope: Option<usize>,
+}
+
+impl AttributeEntry {
+    /// Returns the exact on-disk attribute name bytes.
+    #[must_use]
+    pub fn name_bytes(&self) -> &[u8] {
+        &self.raw_name
+    }
+
+    /// Decodes the pathname-table index used by libfst source-stem attributes.
+    pub fn source_path_index(&self) -> Result<Option<u64>> {
+        if self.attr_type != 0 || !matches!(self.subtype, 4 | 5) {
+            return Ok(None);
+        }
+        let (index, consumed) = decode_varint_with_len(&self.raw_name)?;
+        if consumed != self.raw_name.len() {
+            return Err(Error::decode(
+                "source-stem attribute contains bytes after its path index",
+            ));
+        }
+        Ok(Some(index))
+    }
 }
 
 /// Describes a declared variable.
 #[derive(Debug, Clone)]
 pub struct VarEntry {
+    /// Declared FST variable kind.
     pub var_type: VarType,
+    /// Declared signal direction.
     pub direction: VarDir,
+    /// Local variable name.
     pub name: String,
+    /// Logical value width, or `None` for real/variable-length values.
     pub length: Option<u32>,
+    /// Raw length stored in the hierarchy stream. This differs from [`Self::length`] for VCD
+    /// ports, whose storage length is `3 * logical_width + 2`.
+    pub storage_length: Option<u32>,
+    /// One-based canonical signal handle.
     pub handle: u32,
+    /// Canonical target handle for an alias declaration.
     pub alias_of: Option<u32>,
+    /// Scope index active when the variable was declared.
     pub scope: Option<usize>,
+    /// Whether this declaration aliases an earlier canonical handle.
     pub is_alias: bool,
 }
 
@@ -248,13 +309,15 @@ impl HierarchyBlock {
                 Some(ScopeType::GenAttrBegin) => {
                     let attr_type = next_byte(data, &mut offset)?;
                     let subtype = next_byte(data, &mut offset)?;
-                    let name = read_cstring(data, &mut offset)?;
+                    let raw_name = read_cbytes(data, &mut offset)?;
+                    let name = String::from_utf8_lossy(&raw_name).into_owned();
                     let argument = decode_varint_slice(data, &mut offset)?;
                     let scope = scope_stack.last().copied();
                     attributes.push(AttributeEntry {
                         attr_type,
                         subtype,
                         name,
+                        raw_name,
                         argument,
                         scope,
                     });
@@ -278,7 +341,28 @@ impl HierarchyBlock {
             let len = decode_varint_slice(data, &mut offset)?;
             let alias = decode_varint_slice(data, &mut offset)?;
 
-            let length = if len == 0 { None } else { Some(len as u32) };
+            let storage_length = if len == 0 {
+                None
+            } else {
+                Some(
+                    u32::try_from(len)
+                        .map_err(|_| Error::decode("variable width exceeds u32 range"))?,
+                )
+            };
+            let length = match (var_type, storage_length) {
+                (VarType::VcdPort, Some(storage)) => {
+                    let payload = storage.checked_sub(2).ok_or_else(|| {
+                        Error::decode("VCD port storage length is shorter than delimiters")
+                    })?;
+                    if payload % 3 != 0 {
+                        return Err(Error::decode(
+                            "VCD port storage length does not encode an integral width",
+                        ));
+                    }
+                    Some(payload / 3)
+                }
+                (_, value) => value,
+            };
             let (handle, alias_of, is_alias) = if alias == 0 {
                 current_handle = current_handle
                     .checked_add(1)
@@ -296,6 +380,7 @@ impl HierarchyBlock {
                 direction,
                 name,
                 length,
+                storage_length,
                 handle,
                 alias_of,
                 scope,
@@ -342,7 +427,7 @@ impl HierarchyBlock {
                     out.push(ScopeType::GenAttrBegin.into());
                     out.push(attr.attr_type);
                     out.push(attr.subtype);
-                    write_cstring(&mut out, &attr.name);
+                    write_cbytes(&mut out, &attr.raw_name);
                     encode_varint(attr.argument, &mut out);
                 }
                 HierarchyItem::AttributeEnd => {
@@ -355,8 +440,8 @@ impl HierarchyBlock {
                     out.push(var.var_type.into());
                     out.push(var.direction.into());
                     write_cstring(&mut out, &var.name);
-                    encode_varint(var.length.map(u64::from).unwrap_or(0), &mut out);
-                    encode_varint(var.alias_of.map(u64::from).unwrap_or(0), &mut out);
+                    encode_varint(var.storage_length.map_or(0, u64::from), &mut out);
+                    encode_varint(var.alias_of.map_or(0, u64::from), &mut out);
                 }
             }
         }
@@ -365,21 +450,33 @@ impl HierarchyBlock {
 }
 
 /// Compression strategy for hierarchy blocks.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HierarchyCompression {
+    /// Store the hierarchy token stream without compression.
     Raw,
-    Zlib { level: u32 },
+    /// Compress the hierarchy with a gzip stream at the supplied level.
+    Zlib {
+        /// Compression level passed to the gzip encoder.
+        level: u32,
+    },
+    /// Compress the hierarchy with one raw LZ4 block.
     Lz4,
+    /// Apply the two-stage raw LZ4 representation used by `FST_BL_HIER_LZ4DUO`.
     Lz4Duo,
 }
 
 /// Encoded hierarchy payload ready to be written to disk.
 #[derive(Debug, Clone)]
 pub struct EncodedHierarchy {
+    /// On-disk hierarchy block tag selected by the compression strategy.
     pub block_type: BlockType,
+    /// Section length including the eight-byte length field.
     pub section_length: u64,
+    /// Original hierarchy token-stream length.
     pub uncompressed_len: u64,
+    /// Codec-specific bytes written before [`Self::data`].
     pub stage_prefix: Vec<u8>,
+    /// Stored hierarchy payload bytes.
     pub data: Vec<u8>,
 }
 
@@ -470,15 +567,24 @@ fn decode_lz4_duo(payload: &[u8], expected: usize) -> Result<Vec<u8>> {
 }
 
 fn read_cstring(data: &[u8], offset: &mut usize) -> Result<String> {
+    Ok(String::from_utf8_lossy(&read_cbytes(data, offset)?).into_owned())
+}
+
+fn read_cbytes(data: &[u8], offset: &mut usize) -> Result<Vec<u8>> {
     let start = *offset;
     let end = data[start..]
         .iter()
         .position(|&b| b == 0)
         .map(|pos| start + pos)
         .ok_or_else(|| Error::decode("unterminated string in hierarchy block"))?;
-    let text = String::from_utf8_lossy(&data[start..end]).to_string();
+    let bytes = data[start..end].to_vec();
     *offset = end + 1;
-    Ok(text)
+    Ok(bytes)
+}
+
+fn write_cbytes(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(value);
+    out.push(0);
 }
 
 fn decode_varint_slice(data: &[u8], offset: &mut usize) -> Result<u64> {

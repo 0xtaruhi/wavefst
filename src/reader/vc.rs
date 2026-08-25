@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
@@ -15,75 +14,112 @@ use lz4_flex::block::decompress as lz4_decompress;
 use crate::block::{FrameSection, PackMarker, TimeSection, TimeTable, VcBlock};
 use crate::encoding::{decode_svarint, decode_varint_with_len};
 use crate::error::{Error, Result};
-use crate::types::{BlockType, PackType};
+use crate::types::{BlockType, FstByteOrder, PackType};
 use crate::util::{read_u64_be, read_varint_from_reader};
 
 /// Fully decoded metadata and payload slices extracted from a value-change block.
 #[derive(Debug, Clone)]
 pub struct VcBlockMeta {
+    /// Fixed metadata from the value-change block header.
     pub header: VcBlock,
+    /// Decoded frame section containing values at the block boundary.
     pub frame: FrameSection,
+    /// Original stored/raw chain payload arena.
     pub chain_buffer: Vec<u8>,
+    /// Arena containing chains that required decompression.
+    pub decoded_chain_buffer: Vec<u8>,
+    /// Per-handle resolved change chains; index zero corresponds to handle one.
     pub chains: Vec<Option<ChainData>>,
+    /// Metadata describing the encoded time table.
     pub time_section: TimeSection,
+    /// Fully decoded timestamp table.
     pub time_table: TimeTable,
+    /// Per-handle chain locations and dynamic aliases.
     pub index: ChainIndex,
+    /// Byte order used to decode real-valued changes.
+    pub double_byte_order: FstByteOrder,
 }
 
 /// Resolved per-handle chain metadata extracted from the block index.
 #[derive(Debug, Clone, Default)]
 pub struct ChainIndex {
+    /// Per-handle slots; index zero corresponds to handle one.
     pub slots: Vec<Option<ChainSlot>>,
 }
 
 /// Offset/length pair describing where compressed chain data resides for a handle.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainSlot {
+    /// Byte offset of the stored chain within the chain section.
     pub offset: u64,
+    /// Stored chain length in bytes.
     pub length: u32,
+    /// Canonical handle when this slot is a dynamic alias.
     pub alias_of: Option<u32>,
 }
 
 /// In-memory representation of a handle's change stream.
 #[derive(Debug, Clone)]
 pub struct ChainData {
+    /// One-based signal handle represented by this chain.
     pub handle: u32,
+    /// Encoded chain length before decompression.
     pub stored_len: u32,
+    /// Location of the decoded payload in one of the block arenas.
     pub payload: ChainPayload,
+    /// Canonical handle when this chain is a dynamic alias.
     pub alias_of: Option<u32>,
 }
 
-/// Borrowed or owned slice containing uncompressed chain bytes.
+/// Slice containing uncompressed chain bytes.
 #[derive(Debug, Clone)]
 pub enum ChainPayload {
-    Borrowed { range: Range<usize> },
-    Owned(Vec<u8>),
+    /// Bytes can be borrowed directly from [`VcBlockMeta::chain_buffer`].
+    Borrowed {
+        /// Byte range inside the stored/raw chain arena.
+        range: Range<usize>,
+    },
+    /// Bytes reside in [`VcBlockMeta::decoded_chain_buffer`].
+    Decoded {
+        /// Byte range inside the decoded chain arena.
+        range: Range<usize>,
+    },
 }
 
 impl ChainPayload {
     /// Returns a view of the payload as a byte slice, borrowing when possible.
-    pub fn as_slice<'a>(&'a self, backing: &'a [u8]) -> Cow<'a, [u8]> {
+    pub fn as_slice<'a>(&self, backing: &'a [u8], decoded_backing: &'a [u8]) -> &'a [u8] {
         match self {
-            ChainPayload::Borrowed { range } => Cow::Borrowed(&backing[range.clone()]),
-            ChainPayload::Owned(data) => Cow::Borrowed(data),
+            ChainPayload::Borrowed { range } => &backing[range.clone()],
+            ChainPayload::Decoded { range } => &decoded_backing[range.clone()],
         }
     }
 
-    pub fn len(&self, _backing: &[u8]) -> usize {
+    /// Returns the payload length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
         match self {
-            ChainPayload::Borrowed { range } => range.end - range.start,
-            ChainPayload::Owned(data) => data.len(),
+            ChainPayload::Borrowed { range } | ChainPayload::Decoded { range } => {
+                range.end - range.start
+            }
         }
+    }
+
+    /// Returns `true` when the payload range is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
-pub fn parse_vc_block<R: Read + Seek>(
+pub(crate) fn parse_vc_block<R: Read + Seek>(
     reader: &mut R,
     block_type: BlockType,
     section_start: u64,
     payload_len: u64,
     max_block_bytes: u64,
     max_handles: u64,
+    double_byte_order: FstByteOrder,
 ) -> Result<VcBlockMeta> {
     if payload_len < 61 {
         return Err(Error::invalid(
@@ -130,9 +166,10 @@ pub fn parse_vc_block<R: Read + Seek>(
     )?;
 
     let (vc_max_handle, _) = read_varint_from_reader(reader)?;
-    if vc_max_handle > max_handles {
+    if vc_max_handle > max_handles || vc_max_handle > u64::from(u32::MAX) {
         return Err(Error::invalid(format!(
-            "value-change block declares {vc_max_handle} handles, above configured limit {max_handles}"
+            "value-change block declares {vc_max_handle} handles, above supported/configured limit {}",
+            max_handles.min(u64::from(u32::MAX))
         )));
     }
     let vc_max_handle_usize = usize::try_from(vc_max_handle)
@@ -229,7 +266,7 @@ pub fn parse_vc_block<R: Read + Seek>(
 
     reader.seek(SeekFrom::Start(block_end))?;
 
-    let chains = build_chains(
+    let (chains, decoded_chain_buffer) = build_chains(
         &chain_buffer,
         chain_start,
         &index,
@@ -240,10 +277,12 @@ pub fn parse_vc_block<R: Read + Seek>(
         header,
         frame,
         chain_buffer,
+        decoded_chain_buffer,
         chains,
         time_section,
         time_table,
         index,
+        double_byte_order,
     })
 }
 
@@ -252,7 +291,7 @@ fn build_chains(
     chain_start: u64,
     index: &ChainIndex,
     pack_type: PackType,
-) -> Result<Vec<Option<ChainData>>> {
+) -> Result<(Vec<Option<ChainData>>, Vec<u8>)> {
     struct ChainJob<'a> {
         handle_index: usize,
         alias_of: Option<u32>,
@@ -274,6 +313,9 @@ fn build_chains(
         let Some(slot) = slot_opt else {
             continue;
         };
+        if slot.alias_of.is_some() {
+            continue;
+        }
 
         let rel_offset = slot
             .offset
@@ -281,7 +323,8 @@ fn build_chains(
             .ok_or_else(|| Error::decode("chain slot precedes chain buffer"))?;
         let rel_offset = usize::try_from(rel_offset)
             .map_err(|_| Error::decode("chain offset exceeds addressable memory"))?;
-        let length = slot.length as usize;
+        let length = usize::try_from(slot.length)
+            .map_err(|_| Error::decode("chain length exceeds addressable memory"))?;
         let end = rel_offset
             .checked_add(length)
             .ok_or_else(|| Error::decode("chain slot length overflow"))?;
@@ -345,16 +388,50 @@ fn build_chains(
     #[cfg(not(feature = "parallel"))]
     let results: Vec<ChainJobResult> = jobs.into_iter().map(decompress).collect::<Result<_>>()?;
 
+    let decoded_capacity = results.iter().map(|result| result.payload.len()).sum();
+    let mut decoded_arena = Vec::with_capacity(decoded_capacity);
+    let mut decoded_meta = Vec::with_capacity(results.len());
     for result in results {
-        chains[result.handle_index] = Some(ChainData {
-            handle: result.handle_index as u32,
-            stored_len: result.stored_len,
-            payload: ChainPayload::Owned(result.payload),
-            alias_of: result.alias_of,
+        let start = decoded_arena.len();
+        decoded_arena.extend_from_slice(&result.payload);
+        let end = decoded_arena.len();
+        decoded_meta.push((
+            result.handle_index,
+            result.alias_of,
+            result.stored_len,
+            start..end,
+        ));
+    }
+    for (handle_index, alias_of, stored_len, range) in decoded_meta {
+        chains[handle_index] = Some(ChainData {
+            handle: (handle_index + 1) as u32,
+            stored_len,
+            payload: ChainPayload::Decoded { range },
+            alias_of,
         });
     }
 
-    Ok(chains)
+    for (handle_index, slot_opt) in index.slots.iter().enumerate() {
+        let Some(slot) = slot_opt else {
+            continue;
+        };
+        let Some(target) = slot.alias_of else {
+            continue;
+        };
+        let target_index = (target - 1) as usize;
+        let canonical = chains
+            .get(target_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| Error::decode("dynamic alias target has no canonical chain"))?;
+        chains[handle_index] = Some(ChainData {
+            handle: (handle_index + 1) as u32,
+            stored_len: canonical.stored_len,
+            payload: canonical.payload.clone(),
+            alias_of: Some(target),
+        });
+    }
+
+    Ok((chains, decoded_arena))
 }
 
 fn decompress_chain_payload(
@@ -417,11 +494,14 @@ fn decompress_chain_payload(
                 let expected_len_i32 = i32::try_from(expected_len)
                     .map_err(|_| Error::decode("fastlz output length exceeds i32 range"))?;
                 let mut out = vec![0u8; expected_len];
+                // SAFETY: the input and output pointers remain valid for the exact lengths passed
+                // to FastLZ. The decoder is bounded by `expected_len_i32`, and its return value is
+                // validated below before the initialized output is exposed.
                 let written = unsafe {
                     fastlz_decompress(
-                        input.as_ptr() as *const _,
+                        input.as_ptr().cast(),
                         input_len,
-                        out.as_mut_ptr() as *mut _,
+                        out.as_mut_ptr().cast(),
                         expected_len_i32,
                     )
                 };
@@ -469,8 +549,8 @@ fn decode_chain_index<R: Read + Seek>(
         Alias { target: usize },
     }
 
-    let mut entries: Vec<EntryTmp> = Vec::with_capacity(max_handle_hint + 1);
-    let mut has_payload: Vec<bool> = Vec::with_capacity(max_handle_hint + 1);
+    let mut entries: Vec<EntryTmp> = Vec::with_capacity(max_handle_hint);
+    let mut has_payload: Vec<bool> = Vec::with_capacity(max_handle_hint);
     let mut slice = bytes.as_slice();
     let mut last_offset = 0u64;
     let mut last_alias_target: Option<usize> = None;
@@ -500,8 +580,9 @@ fn decode_chain_index<R: Read + Seek>(
                 }
                 let target = ((-shval) as u64)
                     .checked_sub(1)
-                    .ok_or_else(|| Error::decode("invalid alias target"))?
-                    as usize;
+                    .ok_or_else(|| Error::decode("invalid alias target"))?;
+                let target = usize::try_from(target)
+                    .map_err(|_| Error::decode("alias target exceeds addressable range"))?;
                 entries.push(EntryTmp::Alias { target });
                 has_payload.push(false);
                 last_alias_target = Some(target);
@@ -540,8 +621,9 @@ fn decode_chain_index<R: Read + Seek>(
                 }
                 let target = alias
                     .checked_sub(1)
-                    .ok_or_else(|| Error::decode("invalid alias handle"))?
-                    as usize;
+                    .ok_or_else(|| Error::decode("invalid alias handle"))?;
+                let target = usize::try_from(target)
+                    .map_err(|_| Error::decode("alias target exceeds addressable range"))?;
                 entries.push(EntryTmp::Alias { target });
                 has_payload.push(false);
                 last_alias_target = Some(target);
@@ -550,7 +632,8 @@ fn decode_chain_index<R: Read + Seek>(
         }
 
         if (value & 1) == 0 {
-            let repeat = (value >> 1) as usize;
+            let repeat = usize::try_from(value >> 1)
+                .map_err(|_| Error::decode("empty chain run exceeds addressable range"))?;
             let remaining = max_handle_hint.saturating_sub(entries.len());
             if repeat == 0 || repeat > remaining {
                 return Err(Error::decode("invalid empty run in chain index"));
@@ -615,6 +698,9 @@ fn decode_chain_index<R: Read + Seek>(
             return Err(Error::decode("chain offset precedes pack marker"));
         }
         *off -= PACK_MARKER_PREFIX;
+        if *off > total_chain_len {
+            return Err(Error::decode("chain offset exceeds chain payload bounds"));
+        }
     }
 
     let mut prev_data_idx: Option<usize> = None;
@@ -623,7 +709,13 @@ fn decode_chain_index<R: Read + Seek>(
             if let Some(prev) = prev_data_idx
                 && let Some(prev_off) = offsets[prev]
             {
-                lengths[prev] = Some((off - prev_off) as u32);
+                let span = off
+                    .checked_sub(prev_off)
+                    .ok_or_else(|| Error::decode("chain offsets are not monotonic"))?;
+                lengths[prev] = Some(
+                    u32::try_from(span)
+                        .map_err(|_| Error::decode("chain payload exceeds u32 range"))?,
+                );
             }
             prev_data_idx = Some(idx);
         }
@@ -631,7 +723,12 @@ fn decode_chain_index<R: Read + Seek>(
     if let Some(last_idx) = prev_data_idx
         && let Some(last_off) = offsets[last_idx]
     {
-        lengths[last_idx] = Some((total_chain_len - last_off) as u32);
+        let span = total_chain_len
+            .checked_sub(last_off)
+            .ok_or_else(|| Error::decode("chain offset exceeds payload bounds"))?;
+        lengths[last_idx] = Some(
+            u32::try_from(span).map_err(|_| Error::decode("chain payload exceeds u32 range"))?,
+        );
     }
 
     fn resolve(
@@ -674,18 +771,27 @@ fn decode_chain_index<R: Read + Seek>(
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum CanonicalResolution {
+        Unknown,
+        Missing,
+        Found(usize),
+    }
+
     fn resolve_canonical(
         idx: usize,
         alias_targets: &[Option<usize>],
         has_payload: &[bool],
-        memo: &mut [Option<Option<usize>>],
+        memo: &mut [CanonicalResolution],
         visiting: &mut [bool],
     ) -> Option<usize> {
-        if let Some(cached) = memo[idx] {
-            return cached;
+        match memo[idx] {
+            CanonicalResolution::Found(canonical) => return Some(canonical),
+            CanonicalResolution::Missing => return None,
+            CanonicalResolution::Unknown => {}
         }
         if visiting[idx] {
-            memo[idx] = Some(None);
+            memo[idx] = CanonicalResolution::Missing;
             return None;
         }
         visiting[idx] = true;
@@ -701,11 +807,11 @@ fn decode_chain_index<R: Read + Seek>(
             None
         };
         visiting[idx] = false;
-        memo[idx] = Some(result);
+        memo[idx] = result.map_or(CanonicalResolution::Missing, CanonicalResolution::Found);
         result
     }
 
-    let mut canonical_memo = vec![None; alias_targets.len()];
+    let mut canonical_memo = vec![CanonicalResolution::Unknown; alias_targets.len()];
     let mut canonical_visiting = vec![false; alias_targets.len()];
     let mut canonical = Vec::with_capacity(alias_targets.len());
     for idx in 0..alias_targets.len() {
@@ -744,10 +850,6 @@ fn decode_chain_index<R: Read + Seek>(
             }
             _ => slots.push(None),
         }
-    }
-
-    if slots.len() < max_handle_hint + 1 {
-        slots.resize(max_handle_hint + 1, None);
     }
 
     Ok(ChainIndex { slots })

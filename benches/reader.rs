@@ -8,6 +8,8 @@ use wavefst::{
 };
 
 const TOGGLE_COUNT: usize = 256;
+const DENSE_SIGNALS: usize = 512;
+const DENSE_STEPS: usize = 128;
 
 fn generate_trace(chain: ChainCompression, time: TimeCompression) -> Vec<u8> {
     let cursor = Cursor::new(Vec::new());
@@ -100,6 +102,49 @@ fn generate_trace(chain: ChainCompression, time: TimeCompression) -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn generate_dense_trace(chain: ChainCompression, time: TimeCompression) -> Vec<u8> {
+    let mut writer = FstWriter::builder(Cursor::new(Vec::new()))
+        .chain_compression(chain)
+        .time_compression(time)
+        .build()
+        .expect("construct writer");
+    writer
+        .begin_scope(ScopeType::VcdModule, "dense", None)
+        .expect("begin scope");
+    let handles: Vec<_> = (0..DENSE_SIGNALS)
+        .map(|signal| {
+            writer
+                .add_variable(
+                    VarType::VcdWire,
+                    VarDir::Implicit,
+                    format!("s{signal}"),
+                    GeomEntry::Fixed(1),
+                )
+                .expect("add bit")
+        })
+        .collect();
+    writer.end_scope().expect("end scope");
+    writer.write_header(Header::default()).expect("header");
+
+    let mut states: Vec<u64> = (1..=DENSE_SIGNALS)
+        .map(|signal| (signal as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .collect();
+    let mut batch: Vec<_> = handles.into_iter().map(|handle| (handle, false)).collect();
+    for step in 0..DENSE_STEPS {
+        for (signal, item) in batch.iter_mut().enumerate() {
+            let state = &mut states[signal];
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            item.1 = *state & 1 != 0;
+        }
+        writer
+            .emit_binary_batch(step as u64, &batch)
+            .expect("emit binary batch");
+    }
+    writer.finish().expect("finish").into_inner()
+}
+
 fn bench_placeholder(c: &mut Criterion) {
     #[allow(unused_mut, clippy::useless_vec)]
     let mut configs = vec![("raw", ChainCompression::Raw, TimeCompression::Raw)];
@@ -160,6 +205,66 @@ fn bench_placeholder(c: &mut Criterion) {
             });
         });
     }
+    group.finish();
+
+    #[cfg(feature = "gzip")]
+    let dense = generate_dense_trace(ChainCompression::Zlib, TimeCompression::Zlib);
+    #[cfg(all(not(feature = "gzip"), feature = "lz4"))]
+    let dense = generate_dense_trace(ChainCompression::Lz4, TimeCompression::Raw);
+    #[cfg(not(any(feature = "gzip", feature = "lz4")))]
+    let dense = generate_dense_trace(ChainCompression::Raw, TimeCompression::Raw);
+
+    let mut group = c.benchmark_group("reader_dense_scan");
+    group.bench_function("ordered_binary_fold", |b| {
+        b.iter(|| {
+            let mut reader = ReaderBuilder::new(Cursor::new(dense.as_slice()))
+                .build()
+                .unwrap();
+            let mut count = 0usize;
+            while let Some(changes) = reader.next_value_changes().unwrap() {
+                count = changes
+                    .try_fold_binary(count, |count, timestamp, handle, alias, value| {
+                        std::hint::black_box((timestamp, handle, alias, value));
+                        count + 1
+                    })
+                    .unwrap();
+            }
+            std::hint::black_box(count);
+        });
+    });
+    group.bench_function("handle_major", |b| {
+        b.iter(|| {
+            let mut reader = ReaderBuilder::new(Cursor::new(dense.as_slice()))
+                .build()
+                .unwrap();
+            while let Some(changes) = reader.next_value_changes().unwrap() {
+                changes
+                    .try_for_each_parts_unordered(|timestamp, handle, alias, value| {
+                        std::hint::black_box((timestamp, handle, alias, value));
+                    })
+                    .unwrap();
+            }
+        });
+    });
+    #[cfg(feature = "parallel")]
+    group.bench_function("parallel_fold", |b| {
+        b.iter(|| {
+            let mut reader = ReaderBuilder::new(Cursor::new(dense.as_slice()))
+                .build()
+                .unwrap();
+            let mut count = 0usize;
+            while let Some(changes) = reader.next_value_changes().unwrap() {
+                count += changes
+                    .try_fold_parts_parallel(
+                        || 0usize,
+                        |count, _, _, _, _| *count += 1,
+                        |left, right| left + right,
+                    )
+                    .unwrap();
+            }
+            std::hint::black_box(count);
+        });
+    });
     group.finish();
 }
 

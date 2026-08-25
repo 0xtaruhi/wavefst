@@ -33,6 +33,7 @@ fn hierarchy_snapshot_contains_scopes() {
         direction: wavefst::VarDir::Implicit,
         name: "sig".into(),
         length: Some(1),
+        storage_length: Some(1),
         handle: 1,
         alias_of: None,
         scope: Some(1),

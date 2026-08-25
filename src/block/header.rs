@@ -2,8 +2,8 @@ use std::convert::TryFrom;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::{Error, Result};
-use crate::types::{BlockType, FileType};
-use crate::util::{read_cstring, read_f64_be, read_u64_be, validate_endian};
+use crate::types::{BlockType, FileType, FstByteOrder};
+use crate::util::{read_array, read_cstring, read_u64_be};
 
 /// Fixed sizes of textual header fields, as defined by the FST specification.
 pub const VERSION_FIELD_LEN: usize = 128;
@@ -35,6 +35,8 @@ pub struct Header {
     pub version: String,
     /// Producer supplied date string (null terminated within the 119-byte buffer).
     pub date: String,
+    /// Byte order used for IEEE-754 marker, frame, and real value-change bytes.
+    pub double_byte_order: FstByteOrder,
     /// File type marker (e.g. Verilog, VHDL, mixed).
     pub file_type: FileType,
     /// Simulation time zero offset stored in the header.
@@ -54,7 +56,8 @@ impl Default for Header {
             vc_section_count: 0,
             timescale_exponent: -9,
             version: String::from("wavefst"),
-            date: String::from(""),
+            date: String::new(),
+            double_byte_order: FstByteOrder::native(),
             file_type: FileType::Verilog,
             time_zero: 0,
         }
@@ -84,8 +87,15 @@ impl Header {
         }
         let start_time = read_u64_be(reader)?;
         let end_time = read_u64_be(reader)?;
-        let endian_test = read_f64_be(reader)?;
-        validate_endian(endian_test)?;
+        let endian_bytes = read_array::<8, _>(reader)?;
+        let double_byte_order =
+            if f64::from_le_bytes(endian_bytes).to_bits() == std::f64::consts::E.to_bits() {
+                FstByteOrder::LittleEndian
+            } else if f64::from_be_bytes(endian_bytes).to_bits() == std::f64::consts::E.to_bits() {
+                FstByteOrder::BigEndian
+            } else {
+                return Err(Error::invalid("unexpected FST endian test marker"));
+            };
         let memory_used = read_u64_be(reader)?;
         let scope_count = read_u64_be(reader)?;
         let var_count = read_u64_be(reader)?;
@@ -94,7 +104,7 @@ impl Header {
 
         let mut timescale_buf = [0u8; 1];
         reader.read_exact(&mut timescale_buf)?;
-        let timescale_exponent = timescale_buf[0] as i8;
+        let timescale_exponent = timescale_buf[0].cast_signed();
 
         let version = read_cstring(reader, VERSION_FIELD_LEN)?;
         let date = read_cstring(reader, DATE_FIELD_LEN)?;
@@ -103,7 +113,7 @@ impl Header {
         reader.read_exact(&mut file_type_buf)?;
         let file_type = FileType::try_from(file_type_buf[0])
             .map_err(|_| Error::invalid(format!("unknown FST file type {}", file_type_buf[0])))?;
-        let time_zero = read_u64_be(reader)? as i64;
+        let time_zero = read_u64_be(reader)?.cast_signed();
         if section_length > 329 {
             let extension = i64::try_from(section_length - 329)
                 .map_err(|_| Error::invalid("header extension exceeds seek range"))?;
@@ -122,13 +132,15 @@ impl Header {
             timescale_exponent,
             version,
             date,
+            double_byte_order,
             file_type,
             time_zero,
         })
     }
 
     /// Returns the timescale as 10^exponent seconds.
+    #[must_use]
     pub fn timescale_factor(&self) -> f64 {
-        10f64.powi(self.timescale_exponent as i32)
+        10f64.powi(i32::from(self.timescale_exponent))
     }
 }

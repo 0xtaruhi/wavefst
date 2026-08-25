@@ -2,13 +2,17 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::str;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::block::{GeomEntry, GeomInfo};
 use crate::encoding::decode_varint_with_len;
 use crate::error::{Error, Result};
 use crate::reader::vc::{ChainIndex, ChainPayload, VcBlockMeta};
-use crate::types::SignalValue;
+use crate::types::{FstByteOrder, SignalValue};
 
 const FST_RCV_STR: [char; 8] = ['x', 'z', 'h', 'u', 'w', 'l', '-', '?'];
+const NO_CURSOR: usize = usize::MAX;
 
 #[derive(Debug, Clone, Copy)]
 enum SignalKind {
@@ -47,10 +51,11 @@ struct ChainCursor<'a> {
     offset: usize,
     current_time_index: usize,
     next_marker: Option<(u64, usize, usize)>,
+    double_byte_order: FstByteOrder,
 }
 
 impl<'a> ChainCursor<'a> {
-    fn new(handle: u32, kind: SignalKind, data: &'a [u8]) -> Self {
+    fn new(handle: u32, kind: SignalKind, data: &'a [u8], double_byte_order: FstByteOrder) -> Self {
         Self {
             handle,
             kind,
@@ -58,6 +63,7 @@ impl<'a> ChainCursor<'a> {
             offset: 0,
             current_time_index: 0,
             next_marker: None,
+            double_byte_order,
         }
     }
 
@@ -197,15 +203,39 @@ impl<'a> ChainCursor<'a> {
                     let mut buf = [0u8; 8];
                     buf.copy_from_slice(&self.data[self.offset..end]);
                     self.offset = end;
-                    let value = if cfg!(target_endian = "little") {
-                        f64::from_bits(u64::from_le_bytes(buf))
-                    } else {
-                        f64::from_bits(u64::from_be_bytes(buf))
-                    };
+                    let value = self.double_byte_order.decode_f64(buf);
                     Ok(Some(SignalValue::Real(value)))
                 }
             }
         }
+    }
+
+    #[inline]
+    fn read_binary(&mut self, expected_time_index: usize) -> Result<Option<bool>> {
+        if self.offset >= self.data.len() {
+            return Ok(None);
+        }
+        let (marker, consumed, delta) = match self.next_marker.take() {
+            Some(cached) => cached,
+            None => {
+                let (marker, consumed) = decode_varint_with_len(&self.data[self.offset..])?;
+                (marker, consumed, self.compute_delta(marker))
+            }
+        };
+        self.offset += consumed;
+        self.current_time_index = self
+            .current_time_index
+            .checked_add(delta)
+            .ok_or_else(|| Error::decode("chain time index overflow"))?;
+        if self.current_time_index != expected_time_index {
+            return Err(Error::decode("chain scheduling mismatch"));
+        }
+        if marker & 1 != 0 {
+            return Err(Error::decode(
+                "binary fold encountered an extended-state bit value",
+            ));
+        }
+        Ok(Some((marker >> 1) & 1 != 0))
     }
 
     #[inline]
@@ -224,32 +254,37 @@ impl<'a> ChainCursor<'a> {
 }
 
 #[derive(Debug, Clone)]
+/// One decoded signal transition from a value-change block.
 pub struct ValueChange<'a> {
+    /// Absolute simulation timestamp.
     pub timestamp: u64,
+    /// One-based signal handle.
     pub handle: u32,
+    /// Canonical handle when this event was expanded from a dynamic alias.
     pub alias_of: Option<u32>,
+    /// Borrowed decoded signal value.
     pub value: SignalValue<'a>,
 }
 
+/// Validating iterator and high-throughput traversal API for one value-change block.
 pub struct VcBlockChanges<'a> {
     block: &'a VcBlockMeta,
     cursors: Vec<ChainCursor<'a>>,
-    schedule_heads: Vec<Option<usize>>,
-    schedule_next: Vec<Option<usize>>,
+    schedule_heads: Vec<usize>,
+    schedule_next: Vec<usize>,
     pending_aliases: VecDeque<ValueChange<'a>>,
     alias_map: Vec<Vec<u32>>,
     time_index: usize,
 }
 
 impl<'a> VcBlockChanges<'a> {
+    /// Builds a traversal from decoded block metadata, geometry, and alias information.
     pub fn new(
         block: &'a VcBlockMeta,
         geom: &'a GeomInfo,
         alias_index: &'a ChainIndex,
     ) -> Result<Self> {
         let mut cursors = Vec::new();
-        let mut handle_to_cursor = vec![None; block.chains.len()];
-
         for (idx, chain_opt) in block.chains.iter().enumerate() {
             let Some(chain) = chain_opt else {
                 continue;
@@ -264,23 +299,27 @@ impl<'a> VcBlockChanges<'a> {
             let kind = SignalKind::from_geom(geom_entry, handle)?;
             let data = match &chain.payload {
                 ChainPayload::Borrowed { range } => &block.chain_buffer[range.clone()],
-                ChainPayload::Owned(buffer) => buffer.as_slice(),
+                ChainPayload::Decoded { range } => &block.decoded_chain_buffer[range.clone()],
             };
-            handle_to_cursor[idx] = Some(cursors.len());
-            cursors.push(ChainCursor::new(handle, kind, data));
+            cursors.push(ChainCursor::new(
+                handle,
+                kind,
+                data,
+                block.double_byte_order,
+            ));
         }
 
         let time_len = block.time_table.timestamps.len();
-        let mut schedule_heads = vec![None; time_len];
-        let mut schedule_next = vec![None; cursors.len()];
+        let mut schedule_heads = vec![NO_CURSOR; time_len];
+        let mut schedule_next = vec![NO_CURSOR; cursors.len()];
 
         for (idx, cursor) in cursors.iter_mut().enumerate() {
             if let Some(delta) = cursor.peek_delta()? {
                 if delta >= time_len {
                     return Err(Error::decode("initial chain delta exceeds time table"));
                 }
-                schedule_next[idx] = schedule_heads[delta].take();
-                schedule_heads[delta] = Some(idx);
+                schedule_next[idx] = schedule_heads[delta];
+                schedule_heads[delta] = idx;
             }
         }
 
@@ -313,11 +352,12 @@ impl<'a> VcBlockChanges<'a> {
         F: FnMut(ValueChange<'a>),
     {
         while self.time_index < self.schedule_heads.len() {
-            let Some(cursor_idx) = self.schedule_heads[self.time_index].take() else {
+            let cursor_idx = self.schedule_heads[self.time_index];
+            if cursor_idx == NO_CURSOR {
                 self.time_index += 1;
                 continue;
-            };
-            self.schedule_heads[self.time_index] = self.schedule_next[cursor_idx].take();
+            }
+            self.schedule_heads[self.time_index] = self.schedule_next[cursor_idx];
             let timestamp = self.block.time_table.timestamps[self.time_index];
             let cursor = &mut self.cursors[cursor_idx];
             let Some(value) = cursor.read_value(self.time_index)? else {
@@ -331,8 +371,8 @@ impl<'a> VcBlockChanges<'a> {
                 if next_time >= self.schedule_heads.len() {
                     return Err(Error::decode("chain delta exceeds time table"));
                 }
-                self.schedule_next[cursor_idx] = self.schedule_heads[next_time].take();
-                self.schedule_heads[next_time] = Some(cursor_idx);
+                self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                self.schedule_heads[next_time] = cursor_idx;
             }
 
             let handle = cursor.handle;
@@ -365,6 +405,276 @@ impl<'a> VcBlockChanges<'a> {
         Ok(())
     }
 
+    /// Visits timestamp, handle, dynamic-alias target, and value as separate arguments.
+    /// This is the lowest-overhead validated scan path for callers that do not need a
+    /// [`ValueChange`] aggregate.
+    #[inline]
+    pub fn try_for_each_parts<F>(self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(u64, u32, Option<u32>, SignalValue<'a>),
+    {
+        self.try_fold_parts((), |(), timestamp, handle, alias_of, value| {
+            visitor(timestamp, handle, alias_of, value);
+        })
+    }
+
+    /// Strictly timestamp-ordered fold over the validated change stream.
+    /// Passing the accumulator by value lets scalar reductions remain in registers.
+    #[inline]
+    pub fn try_fold_parts<T, F>(mut self, mut accumulator: T, mut fold: F) -> Result<T>
+    where
+        F: FnMut(T, u64, u32, Option<u32>, SignalValue<'a>) -> T,
+    {
+        while self.time_index < self.schedule_heads.len() {
+            let mut cursor_idx =
+                std::mem::replace(&mut self.schedule_heads[self.time_index], NO_CURSOR);
+            if cursor_idx == NO_CURSOR {
+                self.time_index += 1;
+                continue;
+            }
+            let timestamp = self.block.time_table.timestamps[self.time_index];
+            while cursor_idx != NO_CURSOR {
+                let next_cursor = self.schedule_next[cursor_idx];
+                let cursor = &mut self.cursors[cursor_idx];
+                let value = cursor
+                    .read_value(self.time_index)?
+                    .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
+                let next_delta = cursor.peek_delta()?;
+                if let Some(next_delta) = next_delta {
+                    let next_time = self
+                        .time_index
+                        .checked_add(next_delta)
+                        .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                    if next_time >= self.schedule_heads.len() {
+                        return Err(Error::decode("chain delta exceeds time table"));
+                    }
+                    if next_time == self.time_index {
+                        self.schedule_next[cursor_idx] = next_cursor;
+                    } else {
+                        self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                        self.schedule_heads[next_time] = cursor_idx;
+                    }
+                }
+
+                let handle = cursor.handle;
+                let aliases = &self.alias_map[handle as usize];
+                if aliases.is_empty() {
+                    accumulator = fold(accumulator, timestamp, handle, None, value);
+                } else {
+                    accumulator = fold(accumulator, timestamp, handle, None, value.clone());
+                    for &alias in aliases {
+                        accumulator =
+                            fold(accumulator, timestamp, alias, Some(handle), value.clone());
+                    }
+                }
+
+                cursor_idx = if next_delta == Some(0) {
+                    cursor_idx
+                } else {
+                    next_cursor
+                };
+            }
+            self.time_index += 1;
+        }
+        Ok(accumulator)
+    }
+
+    /// Strictly timestamp-ordered fold specialized for two-state, single-bit traces.
+    /// Returns an error for vector/real/variable-width handles or extended bit states.
+    #[inline]
+    pub fn try_fold_binary<T, F>(mut self, mut accumulator: T, mut fold: F) -> Result<T>
+    where
+        F: FnMut(T, u64, u32, Option<u32>, bool) -> T,
+    {
+        if self
+            .cursors
+            .iter()
+            .any(|cursor| !matches!(cursor.kind, SignalKind::Bit))
+        {
+            return Err(Error::invalid(
+                "binary fold requires every canonical handle to be single-bit",
+            ));
+        }
+
+        while self.time_index < self.schedule_heads.len() {
+            let mut cursor_idx =
+                std::mem::replace(&mut self.schedule_heads[self.time_index], NO_CURSOR);
+            if cursor_idx == NO_CURSOR {
+                self.time_index += 1;
+                continue;
+            }
+            let timestamp = self.block.time_table.timestamps[self.time_index];
+            while cursor_idx != NO_CURSOR {
+                let next_cursor = self.schedule_next[cursor_idx];
+                let cursor = &mut self.cursors[cursor_idx];
+                let value = cursor
+                    .read_binary(self.time_index)?
+                    .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
+                let next_delta = cursor.peek_delta()?;
+                if let Some(next_delta) = next_delta {
+                    let next_time = self
+                        .time_index
+                        .checked_add(next_delta)
+                        .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                    if next_time >= self.schedule_heads.len() {
+                        return Err(Error::decode("chain delta exceeds time table"));
+                    }
+                    if next_time == self.time_index {
+                        self.schedule_next[cursor_idx] = next_cursor;
+                    } else {
+                        self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                        self.schedule_heads[next_time] = cursor_idx;
+                    }
+                }
+
+                let handle = cursor.handle;
+                let aliases = &self.alias_map[handle as usize];
+                accumulator = fold(accumulator, timestamp, handle, None, value);
+                for &alias in aliases {
+                    accumulator = fold(accumulator, timestamp, alias, Some(handle), value);
+                }
+                cursor_idx = if next_delta == Some(0) {
+                    cursor_idx
+                } else {
+                    next_cursor
+                };
+            }
+            self.time_index += 1;
+        }
+        Ok(accumulator)
+    }
+
+    /// Visits changes handle-by-handle instead of globally sorting them by timestamp.
+    /// Per-handle timestamp order is preserved. This cache-friendly path is useful for indexing,
+    /// statistics, and transformations that do not require a global event order.
+    #[inline]
+    pub fn try_for_each_parts_unordered<F>(self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(u64, u32, Option<u32>, SignalValue<'a>),
+    {
+        for mut cursor in self.cursors {
+            let handle = cursor.handle;
+            let aliases = &self.alias_map[handle as usize];
+            while let Some(delta) = cursor.peek_delta()? {
+                let time_index = cursor
+                    .current_time_index
+                    .checked_add(delta)
+                    .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                let timestamp = *self
+                    .block
+                    .time_table
+                    .timestamps
+                    .get(time_index)
+                    .ok_or_else(|| Error::decode("chain delta exceeds time table"))?;
+                let value = cursor
+                    .read_value(time_index)?
+                    .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
+                if aliases.is_empty() {
+                    visitor(timestamp, handle, None, value);
+                    continue;
+                }
+                visitor(timestamp, handle, None, value.clone());
+                for &alias in aliases {
+                    visitor(timestamp, alias, Some(handle), value.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Parallel handle-major scan. Callback invocations may occur concurrently and global event
+    /// order is unspecified; timestamps remain ordered within each canonical handle.
+    #[cfg(feature = "parallel")]
+    pub fn try_for_each_parts_parallel<F>(self, visitor: F) -> Result<()>
+    where
+        F: Fn(u64, u32, Option<u32>, SignalValue<'a>) + Sync + Send,
+    {
+        let timestamps = &self.block.time_table.timestamps;
+        let aliases = &self.alias_map;
+        self.cursors
+            .into_par_iter()
+            .try_for_each(|mut cursor| -> Result<()> {
+                let handle = cursor.handle;
+                let handle_aliases = &aliases[handle as usize];
+                while let Some(delta) = cursor.peek_delta()? {
+                    let time_index = cursor
+                        .current_time_index
+                        .checked_add(delta)
+                        .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                    let timestamp = *timestamps
+                        .get(time_index)
+                        .ok_or_else(|| Error::decode("chain delta exceeds time table"))?;
+                    let value = cursor
+                        .read_value(time_index)?
+                        .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
+                    if handle_aliases.is_empty() {
+                        visitor(timestamp, handle, None, value);
+                        continue;
+                    }
+                    visitor(timestamp, handle, None, value.clone());
+                    for &alias in handle_aliases {
+                        visitor(timestamp, alias, Some(handle), value.clone());
+                    }
+                }
+                Ok(())
+            })
+    }
+
+    /// Parallel handle-major fold with one accumulator per Rayon worker and a final reduction.
+    /// This avoids synchronisation on every event and is the preferred parallel statistics API.
+    #[cfg(feature = "parallel")]
+    pub fn try_fold_parts_parallel<T, Init, Fold, Reduce>(
+        self,
+        init: Init,
+        fold: Fold,
+        reduce: Reduce,
+    ) -> Result<T>
+    where
+        T: Send,
+        Init: Fn() -> T + Sync + Send,
+        Fold: Fn(&mut T, u64, u32, Option<u32>, SignalValue<'a>) + Sync + Send,
+        Reduce: Fn(T, T) -> T + Sync + Send,
+    {
+        let timestamps = &self.block.time_table.timestamps;
+        let aliases = &self.alias_map;
+        let init_ref = &init;
+        self.cursors
+            .into_par_iter()
+            .map(|mut cursor| -> Result<T> {
+                let mut accumulator = init_ref();
+                let handle = cursor.handle;
+                let handle_aliases = &aliases[handle as usize];
+                while let Some(delta) = cursor.peek_delta()? {
+                    let time_index = cursor
+                        .current_time_index
+                        .checked_add(delta)
+                        .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                    let timestamp = *timestamps
+                        .get(time_index)
+                        .ok_or_else(|| Error::decode("chain delta exceeds time table"))?;
+                    let value = cursor
+                        .read_value(time_index)?
+                        .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
+                    if handle_aliases.is_empty() {
+                        fold(&mut accumulator, timestamp, handle, None, value);
+                        continue;
+                    }
+                    fold(&mut accumulator, timestamp, handle, None, value.clone());
+                    for &alias in handle_aliases {
+                        fold(
+                            &mut accumulator,
+                            timestamp,
+                            alias,
+                            Some(handle),
+                            value.clone(),
+                        );
+                    }
+                }
+                Ok(accumulator)
+            })
+            .try_reduce(init_ref, |left, right| Ok(reduce(left, right)))
+    }
+
     #[inline]
     fn next_canonical(&mut self) -> Result<Option<ValueChange<'a>>> {
         loop {
@@ -376,11 +686,12 @@ impl<'a> VcBlockChanges<'a> {
                 return Ok(None);
             }
 
-            let Some(cursor_idx) = self.schedule_heads[self.time_index].take() else {
+            let cursor_idx = self.schedule_heads[self.time_index];
+            if cursor_idx == NO_CURSOR {
                 self.time_index += 1;
                 continue;
-            };
-            self.schedule_heads[self.time_index] = self.schedule_next[cursor_idx].take();
+            }
+            self.schedule_heads[self.time_index] = self.schedule_next[cursor_idx];
 
             let timestamp = self.block.time_table.timestamps[self.time_index];
 
@@ -397,8 +708,8 @@ impl<'a> VcBlockChanges<'a> {
                 if next_time >= self.schedule_heads.len() {
                     return Err(Error::decode("chain delta exceeds time table"));
                 }
-                self.schedule_next[cursor_idx] = self.schedule_heads[next_time].take();
-                self.schedule_heads[next_time] = Some(cursor_idx);
+                self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                self.schedule_heads[next_time] = cursor_idx;
             }
 
             let handle = cursor.handle;
@@ -435,11 +746,13 @@ impl<'a> Iterator for VcBlockChanges<'a> {
     }
 }
 
+/// Builds a timestamp-ordered value-change traversal for a decoded block.
 pub fn build_changes<'a>(block: &'a VcBlockMeta, geom: &'a GeomInfo) -> Result<VcBlockChanges<'a>> {
     VcBlockChanges::new(block, geom, &block.index)
 }
 
 impl VcBlockMeta {
+    /// Builds a timestamp-ordered value-change traversal using the supplied geometry.
     pub fn changes<'a>(&'a self, geom: &'a GeomInfo) -> Result<VcBlockChanges<'a>> {
         build_changes(self, geom)
     }

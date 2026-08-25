@@ -23,7 +23,7 @@ impl BlackoutBlock {
         encode_varint(self.events.len() as u64, out);
         let mut prev = 0u64;
         for event in &self.events {
-            out.push(if event.is_on { 1 } else { 0 });
+            out.push(u8::from(event.is_on));
             let delta = event
                 .time
                 .checked_sub(prev)

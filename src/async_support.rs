@@ -7,9 +7,13 @@ use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+use crate::block::HierarchyCompression;
 use crate::error::Result;
 use crate::reader::{FstReader, ReaderBuilder, ReaderOptions};
-use crate::writer::{ChainCompression, FstWriter, TimeCompression, WriterBuilder, WriterOptions};
+use crate::writer::{
+    ChainCompression, DynamicAliasEncoding, FstWriter, TimeCompression, WriterBuilder,
+    WriterOptions,
+};
 
 /// Reader that loads an async source into memory and exposes the synchronous [`FstReader`] API.
 pub struct AsyncReader {
@@ -84,6 +88,7 @@ impl DerefMut for AsyncReader {
 }
 
 /// Builder for [`AsyncWriter`].
+#[must_use]
 pub struct AsyncWriterBuilder<W> {
     sink: W,
     options: WriterOptions,
@@ -113,6 +118,18 @@ impl<W> AsyncWriterBuilder<W> {
     /// Selects the time-table compression.
     pub fn time_compression(mut self, compression: TimeCompression) -> Self {
         self.options.time_compression = compression;
+        self
+    }
+
+    /// Selects compression for the hierarchy declaration block.
+    pub fn hierarchy_compression(mut self, compression: HierarchyCompression) -> Self {
+        self.options.hierarchy_compression = compression;
+        self
+    }
+
+    /// Chooses the legacy or current dynamic-alias index representation.
+    pub fn dynamic_alias_encoding(mut self, encoding: DynamicAliasEncoding) -> Self {
+        self.options.dynamic_alias_encoding = encoding;
         self
     }
 

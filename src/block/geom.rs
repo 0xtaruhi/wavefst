@@ -10,7 +10,7 @@ use crate::util::read_u64_be;
 /// Describes the layout of a single signal as recorded in the geometry block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeomEntry {
-    /// Fixed-width bit-vector stored using `len` bytes.
+    /// Fixed-width value stored using `len` value characters (normally one per logical bit).
     Fixed(u32),
     /// IEEE-754 double precision real value (signalled by zero in the block stream).
     Real,
@@ -19,6 +19,15 @@ pub enum GeomEntry {
 }
 
 impl GeomEntry {
+    /// Constructs the special storage geometry used by `FST_VT_VCD_PORT` for a logical width.
+    pub fn vcd_port(logical_width: u32) -> Result<Self> {
+        let storage_width = logical_width
+            .checked_mul(3)
+            .and_then(|width| width.checked_add(2))
+            .ok_or_else(|| Error::invalid("VCD port width exceeds u32 storage geometry"))?;
+        Ok(Self::Fixed(storage_width))
+    }
+
     fn from_raw(value: u64) -> Result<Self> {
         match value {
             0 => Ok(GeomEntry::Real),
@@ -38,7 +47,7 @@ impl GeomEntry {
 
     fn to_raw(&self) -> u64 {
         match self {
-            GeomEntry::Fixed(len) => *len as u64,
+            GeomEntry::Fixed(len) => u64::from(*len),
             GeomEntry::Real => 0,
             GeomEntry::Variable => 0xFFFF_FFFF,
         }
@@ -74,8 +83,15 @@ impl GeomInfo {
                 .ok_or_else(|| Error::invalid("geometry run expansion overflow"))?;
             entries.resize(new_len, entry);
         }
+        let max_handle = u64::try_from(entries.len())
+            .map_err(|_| Error::invalid("geometry handle count exceeds u64 range"))?;
+        if max_handle > u64::from(u32::MAX) {
+            return Err(Error::invalid(
+                "geometry contains more handles than libfst's u32 handle type",
+            ));
+        }
         Ok(Self {
-            max_handle: entries.len() as u64,
+            max_handle,
             entries,
         })
     }
@@ -89,11 +105,13 @@ impl GeomInfo {
     }
 
     /// Returns an iterator over `(handle, entry)` pairs for all recorded handles.
-    pub fn handles(&self) -> impl Iterator<Item = (u32, &GeomEntry)> {
-        self.entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| (idx as u32 + 1, entry))
+    pub fn handles(&self) -> impl Iterator<Item = (u64, &GeomEntry)> {
+        self.entries.iter().enumerate().map(|(idx, entry)| {
+            (
+                u64::try_from(idx).expect("usize handle index must fit in u64") + 1,
+                entry,
+            )
+        })
     }
 
     /// Decodes a geometry section from the provided reader. The `section_length` must be the raw
@@ -116,6 +134,11 @@ impl GeomInfo {
 
         let uncompressed_len = read_u64_be(reader)?;
         let max_handle = read_u64_be(reader)?;
+        if max_handle > u64::from(u32::MAX) {
+            return Err(Error::invalid(
+                "geometry max handle exceeds libfst's u32 handle type",
+            ));
+        }
         let compressed_len = payload_len
             .checked_sub(16)
             .ok_or_else(|| Error::invalid("geometry compressed length underflow"))?;

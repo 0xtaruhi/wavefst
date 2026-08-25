@@ -73,3 +73,56 @@ pub fn decode_varint_with_len(input: &[u8]) -> Result<(u64, usize)> {
     }
     Err(Error::decode("varint exceeds maximum length"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_varint, decode_varint_with_len, encode_varint};
+
+    #[test]
+    fn round_trips_boundaries_and_deterministic_samples() {
+        let boundaries = [
+            0,
+            1,
+            0x7f,
+            0x80,
+            0x3fff,
+            0x4000,
+            u64::from(u32::MAX),
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for value in
+            boundaries
+                .into_iter()
+                .chain((0..10_000).scan(0x9e37_79b9_7f4a_7c15u64, |state, _| {
+                    *state ^= *state << 7;
+                    *state ^= *state >> 9;
+                    *state ^= *state << 8;
+                    Some(*state)
+                }))
+        {
+            let mut encoded = Vec::new();
+            let encoded_len = encode_varint(value, &mut encoded);
+            assert_eq!(encoded_len, encoded.len());
+            assert!(encoded_len <= 10);
+
+            let mut remaining = encoded.as_slice();
+            assert_eq!(decode_varint(&mut remaining).unwrap(), value);
+            assert!(remaining.is_empty());
+            assert_eq!(
+                decode_varint_with_len(&encoded).unwrap(),
+                (value, encoded_len)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_and_overflowing_encodings() {
+        assert!(decode_varint(&mut &[0x80][..]).is_err());
+        assert!(decode_varint_with_len(&[0x80]).is_err());
+
+        let overflow = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        assert!(decode_varint(&mut &overflow[..]).is_err());
+        assert!(decode_varint_with_len(&overflow).is_err());
+    }
+}
