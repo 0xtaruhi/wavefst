@@ -68,7 +68,11 @@ impl GeomInfo {
             }
             let count_usize = usize::try_from(count)
                 .map_err(|_| Error::invalid("geometry run length exceeds usize"))?;
-            entries.resize(entries.len() + count_usize, entry);
+            let new_len = entries
+                .len()
+                .checked_add(count_usize)
+                .ok_or_else(|| Error::invalid("geometry run expansion overflow"))?;
+            entries.resize(new_len, entry);
         }
         Ok(Self {
             max_handle: entries.len() as u64,
@@ -134,9 +138,11 @@ impl GeomInfo {
         } else {
             #[cfg(feature = "gzip")]
             {
-                let mut decoder = ZlibDecoder::new(&payload[..]);
-                let mut decoded = Vec::with_capacity(expected_uncompressed);
-                decoder.read_to_end(&mut decoded)?;
+                let decoder = ZlibDecoder::new(&payload[..]);
+                let mut decoded = Vec::with_capacity(expected_uncompressed.min(16 * 1024 * 1024));
+                decoder
+                    .take(uncompressed_len.saturating_add(1))
+                    .read_to_end(&mut decoded)?;
                 if decoded.len() != expected_uncompressed {
                     return Err(Error::decode(
                         "geometry decompression length mismatch with header",
@@ -154,6 +160,11 @@ impl GeomInfo {
 
         let max_handle_usize = usize::try_from(max_handle)
             .map_err(|_| Error::invalid("geometry max handle exceeds usize"))?;
+        if max_handle > uncompressed_len {
+            return Err(Error::decode(
+                "geometry handle count exceeds the number representable by its payload",
+            ));
+        }
 
         let mut entries = Vec::with_capacity(max_handle_usize);
         let mut slice = raw.as_slice();

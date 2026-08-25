@@ -1,4 +1,7 @@
+#![cfg(any(feature = "gzip", feature = "lz4"))]
+
 use std::borrow::Cow;
+#[cfg(feature = "gzip")]
 use std::convert::TryInto;
 use std::io::Cursor;
 
@@ -62,6 +65,7 @@ fn writer_emits_header_and_metadata() -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "gzip", feature = "lz4"))]
 #[test]
 fn writer_applies_compression_preferences() -> Result<()> {
     let sink = Cursor::new(Vec::new());
@@ -103,7 +107,7 @@ fn writer_applies_compression_preferences() -> Result<()> {
     assert_eq!(block.header.pack_type(), PackType::Lz4);
     assert_eq!(block.header.frame_max_handle, 1);
     assert_eq!(block.header.frame_uncompressed_len, 1);
-    assert_eq!(block.frame.as_slice(), b"1");
+    assert_eq!(block.frame.as_slice(), b"x");
     assert!(
         block.time_section.compressed_len <= block.time_section.uncompressed_len,
         "time section must not grow after compression"
@@ -174,7 +178,7 @@ fn writer_fastlz_chain_compression() -> Result<()> {
     assert_eq!(block.header.pack_type(), PackType::FastLz);
     assert_eq!(block.header.frame_max_handle, 1);
     assert_eq!(block.header.frame_uncompressed_len, 1);
-    assert_eq!(block.frame.as_slice(), b"0");
+    assert_eq!(block.frame.as_slice(), b"x");
 
     let mut iter_reader = ReaderBuilder::new(Cursor::new(bytes)).build()?;
     let mut iter = iter_reader
@@ -230,11 +234,11 @@ fn writer_handles_multiple_signals_with_raw_encoding() -> Result<()> {
     let block = reader
         .next_vc_block()?
         .expect("value-change block must be present");
-    assert_eq!(block.header.pack_type(), PackType::None);
+    assert_eq!(block.header.pack_type(), PackType::Zlib);
     assert_eq!(block.header.frame_max_handle, 2);
     assert_eq!(block.header.frame_uncompressed_len, 2);
     assert_eq!(block.header.frame_compressed_len, 2);
-    assert_eq!(block.frame.as_slice(), b"0x");
+    assert_eq!(block.frame.as_slice(), b"xx");
 
     let (stored_len_a, consumed_a) = decode_varint_with_len(&block.chain_buffer)?;
     assert_eq!(stored_len_a, 0, "raw chain should use stored_len = 0");
@@ -346,7 +350,7 @@ fn writer_emits_vector_changes() -> Result<()> {
         .next_vc_block()?
         .expect("value-change block must be present");
     assert_eq!(block.header.frame_uncompressed_len, 4);
-    assert_eq!(block.frame.as_slice(), b"zzzz");
+    assert_eq!(block.frame.as_slice(), b"xxxx");
 
     let mut iter_reader = ReaderBuilder::new(Cursor::new(bytes)).build()?;
     let mut iter = iter_reader
@@ -366,6 +370,7 @@ fn writer_emits_vector_changes() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "gzip")]
 #[test]
 fn writer_compresses_redundant_frame_payloads() -> Result<()> {
     let sink = Cursor::new(Vec::new());
@@ -415,8 +420,18 @@ fn writer_compresses_redundant_frame_payloads() -> Result<()> {
     );
     assert_eq!(
         block.frame.as_slice(),
-        vec![b'0'; handle_count].as_slice(),
-        "frame bytes should track the most recent state for each handle"
+        vec![b'x'; handle_count].as_slice(),
+        "frame bytes must contain state at the beginning of the block"
+    );
+    assert_eq!(
+        block
+            .chains
+            .iter()
+            .flatten()
+            .filter(|chain| chain.alias_of.is_some())
+            .count(),
+        handle_count - 1,
+        "identical chains should use dynamic aliases instead of duplicate payloads"
     );
 
     Ok(())
@@ -481,8 +496,8 @@ fn writer_handles_alias_packed_real_and_varlen() -> Result<()> {
 
     assert_eq!(
         events.len(),
-        6,
-        "expected canonical + alias events plus reals/varlen"
+        4,
+        "hierarchy aliases share the canonical handle and do not duplicate value changes"
     );
 
     assert_eq!(events[0].timestamp, 0);
@@ -496,36 +511,37 @@ fn writer_handles_alias_packed_real_and_varlen() -> Result<()> {
         }
     );
 
-    assert_eq!(events[1].timestamp, 0);
-    assert_eq!(events[1].handle, bus_alias);
-    assert_eq!(events[1].alias_of, Some(bus));
-    assert_eq!(events[1].value, events[0].value);
+    assert_eq!(bus_alias, bus);
+    assert_eq!(events[1].timestamp, 5);
+    assert_eq!(events[1].handle, real_sig);
+    assert_eq!(events[1].value, SignalValue::Real(3.125));
 
-    assert_eq!(events[2].timestamp, 5);
-    assert_eq!(events[2].handle, real_sig);
-    assert_eq!(events[2].value, SignalValue::Real(3.125));
-
-    assert_eq!(events[3].timestamp, 10);
-    assert_eq!(events[3].handle, bus);
+    assert_eq!(events[2].timestamp, 10);
+    assert_eq!(events[2].handle, bus);
     assert_eq!(
-        events[3].value,
+        events[2].value,
         SignalValue::PackedBits {
             width: 8,
             bits: Cow::Owned(vec![0b01010101])
         }
     );
 
-    assert_eq!(events[4].timestamp, 10);
-    assert_eq!(events[4].handle, bus_alias);
-    assert_eq!(events[4].alias_of, Some(bus));
-    assert_eq!(events[4].value, events[3].value);
-
-    assert_eq!(events[5].timestamp, 12);
-    assert_eq!(events[5].handle, str_sig);
+    assert_eq!(events[3].timestamp, 12);
+    assert_eq!(events[3].handle, str_sig);
     assert_eq!(
-        events[5].value,
+        events[3].value,
         SignalValue::Bytes(Cow::Owned(b"hello".to_vec()))
     );
+
+    drop(iter);
+    let hierarchy = reader.hierarchy().expect("hierarchy is available");
+    let alias = hierarchy
+        .variables
+        .iter()
+        .find(|variable| variable.name == "bus_alias")
+        .expect("alias declaration exists");
+    assert!(alias.is_alias);
+    assert_eq!(alias.handle, bus);
 
     Ok(())
 }
@@ -564,11 +580,10 @@ fn writer_wraps_with_zlib_envelope() -> Result<()> {
 
     let section_length = u64::from_be_bytes(bytes[1..9].try_into()?);
     let uncompressed_len = u64::from_be_bytes(bytes[9..17].try_into()?);
-    let payload_len = u64::from_be_bytes(bytes[17..25].try_into()?);
-    assert_eq!(section_length, payload_len + 16 + 8);
+    assert_eq!(section_length as usize, bytes.len() - 1);
     assert!(uncompressed_len > 0);
 
-    let mut decoder = GzDecoder::new(&bytes[25..25 + payload_len as usize]);
+    let mut decoder = GzDecoder::new(&bytes[17..]);
     let mut inner = Vec::new();
     decoder.read_to_end(&mut inner)?;
     assert_eq!(inner.len() as u64, uncompressed_len);
@@ -582,6 +597,13 @@ fn writer_wraps_with_zlib_envelope() -> Result<()> {
     assert_eq!(event.handle, handle);
     assert_eq!(event.value, SignalValue::Bit('1'));
     assert!(iter.next().is_none());
+
+    // The high-level reader also unwraps standard whole-file wrappers transparently.
+    let mut wrapped_reader = ReaderBuilder::new(Cursor::new(bytes)).build()?;
+    let mut wrapped_changes = wrapped_reader
+        .next_value_changes()?
+        .expect("wrapped value-change iterator should be available");
+    assert_eq!(wrapped_changes.next().expect("wrapped event")?.timestamp, 2);
 
     Ok(())
 }

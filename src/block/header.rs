@@ -1,8 +1,8 @@
 use std::convert::TryFrom;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::{Error, Result};
-use crate::types::BlockType;
+use crate::types::{BlockType, FileType};
 use crate::util::{read_cstring, read_f64_be, read_u64_be, validate_endian};
 
 /// Fixed sizes of textual header fields, as defined by the FST specification.
@@ -36,9 +36,9 @@ pub struct Header {
     /// Producer supplied date string (null terminated within the 119-byte buffer).
     pub date: String,
     /// File type marker (e.g. Verilog, VHDL, mixed).
-    pub file_type: u8,
+    pub file_type: FileType,
     /// Simulation time zero offset stored in the header.
-    pub time_zero: u64,
+    pub time_zero: i64,
 }
 
 impl Default for Header {
@@ -53,9 +53,9 @@ impl Default for Header {
             max_handle: 0,
             vc_section_count: 0,
             timescale_exponent: -9,
-            version: String::from("fst-format"),
+            version: String::from("wavefst"),
             date: String::from(""),
-            file_type: 0,
+            file_type: FileType::Verilog,
             time_zero: 0,
         }
     }
@@ -77,6 +77,11 @@ impl Header {
         }
 
         let section_length = read_u64_be(reader)?;
+        if section_length < 329 {
+            return Err(Error::invalid(format!(
+                "header section is {section_length} bytes; at least 329 are required"
+            )));
+        }
         let start_time = read_u64_be(reader)?;
         let end_time = read_u64_be(reader)?;
         let endian_test = read_f64_be(reader)?;
@@ -96,8 +101,14 @@ impl Header {
 
         let mut file_type_buf = [0u8; 1];
         reader.read_exact(&mut file_type_buf)?;
-        let file_type = file_type_buf[0];
-        let time_zero = read_u64_be(reader)?;
+        let file_type = FileType::try_from(file_type_buf[0])
+            .map_err(|_| Error::invalid(format!("unknown FST file type {}", file_type_buf[0])))?;
+        let time_zero = read_u64_be(reader)? as i64;
+        if section_length > 329 {
+            let extension = i64::try_from(section_length - 329)
+                .map_err(|_| Error::invalid("header extension exceeds seek range"))?;
+            reader.seek(SeekFrom::Current(extension))?;
+        }
 
         Ok(Self {
             section_length,

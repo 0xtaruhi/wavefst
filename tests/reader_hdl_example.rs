@@ -63,7 +63,10 @@ fn inspect_hdl_example_frame() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(not(feature = "gzip"), ignore = "requires gzip feature")]
+#[cfg_attr(
+    not(all(feature = "gzip", feature = "lz4")),
+    ignore = "fixture requires gzip and lz4 features"
+)]
 #[test]
 fn parse_hdl_example_fst() -> Result<()> {
     let path = fixture_path();
@@ -99,7 +102,10 @@ fn parse_hdl_example_fst() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(not(feature = "gzip"), ignore = "requires gzip feature")]
+#[cfg_attr(
+    not(all(feature = "gzip", feature = "lz4")),
+    ignore = "fixture requires gzip and lz4 features"
+)]
 #[test]
 fn iterate_hdl_example_changes() -> Result<()> {
     let path = fixture_path();
@@ -116,10 +122,7 @@ fn iterate_hdl_example_changes() -> Result<()> {
             change?;
             count += 1;
         }
-        assert_eq!(
-            count, 0,
-            "fixture is expected to contain only the initial frame"
-        );
+        assert_eq!(count, 1049, "event count must match official libfst");
     }
 
     assert!(

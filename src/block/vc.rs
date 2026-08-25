@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::io::{Read, Write};
 
 use super::time::TimeSection;
-use crate::encoding::{decode_varint_with_len, encode_varint};
+use crate::encoding::{decode_varint_with_len, encode_svarint, encode_varint};
 use crate::error::{Error, Result};
 use crate::types::PackType;
 
@@ -87,9 +87,11 @@ impl FrameSection {
         } else {
             #[cfg(feature = "gzip")]
             {
-                let mut decoder = ZlibDecoder::new(&bytes[..]);
-                let mut decoded = Vec::with_capacity(expected_uncompressed);
-                decoder.read_to_end(&mut decoded)?;
+                let decoder = ZlibDecoder::new(&bytes[..]);
+                let mut decoded = Vec::with_capacity(expected_uncompressed.min(16 * 1024 * 1024));
+                decoder
+                    .take(uncompressed_len.saturating_add(1))
+                    .read_to_end(&mut decoded)?;
                 if decoded.len() != expected_uncompressed {
                     return Err(Error::decode("frame decompression length mismatch"));
                 }
@@ -137,9 +139,11 @@ impl TimeTable {
         } else {
             #[cfg(feature = "gzip")]
             {
-                let mut decoder = ZlibDecoder::new(&bytes[..]);
-                let mut decoded = Vec::with_capacity(expected);
-                decoder.read_to_end(&mut decoded)?;
+                let decoder = ZlibDecoder::new(&bytes[..]);
+                let mut decoded = Vec::with_capacity(expected.min(16 * 1024 * 1024));
+                decoder
+                    .take(section.uncompressed_len.saturating_add(1))
+                    .read_to_end(&mut decoded)?;
                 if decoded.len() != expected {
                     return Err(Error::decode("time section decompression mismatch"));
                 }
@@ -153,16 +157,21 @@ impl TimeTable {
             }
         };
 
-        let mut deltas = Vec::with_capacity(section.item_count as usize);
+        let expected_items = usize::try_from(section.item_count)
+            .map_err(|_| Error::invalid("time item count exceeds addressable memory"))?;
+        let mut deltas = Vec::with_capacity(expected_items.min(raw.len()));
         let mut offset = 0usize;
-        while offset < raw.len() && deltas.len() < section.item_count as usize {
+        while offset < raw.len() && deltas.len() < expected_items {
             let (value, consumed) = decode_varint_with_len(&raw[offset..])?;
             deltas.push(value);
             offset += consumed;
         }
 
-        if deltas.len() != section.item_count as usize {
+        if deltas.len() != expected_items {
             return Err(Error::decode("time section item count mismatch"));
+        }
+        if offset != raw.len() {
+            return Err(Error::decode("time section contains trailing data"));
         }
 
         let mut timestamps = Vec::with_capacity(deltas.len());
@@ -206,7 +215,7 @@ pub fn encode_frame_section(
 
     #[cfg(feature = "gzip")]
     {
-        let compressed = zlib_compress(&frame_raw, compression_level)?;
+        let compressed = zlib_compress(&frame_raw, compression_level, 4)?;
         if compressed.len() < frame_raw.len() {
             let compressed_len = u64::try_from(compressed.len())
                 .map_err(|_| Error::invalid("compressed frame payload too large"))?;
@@ -263,7 +272,7 @@ pub fn encode_time_section(
     if compress {
         #[cfg(feature = "gzip")]
         {
-            let compressed = zlib_compress(&time_raw, compression_level)?;
+            let compressed = zlib_compress(&time_raw, compression_level, 9)?;
             if compressed.len() < time_raw.len() {
                 let compressed_len = u64::try_from(compressed.len())
                     .map_err(|_| Error::invalid("compressed time section too large"))?;
@@ -295,17 +304,19 @@ pub fn encode_time_section(
 /// Encodes an individual chain payload according to the selected compression marker.
 pub fn encode_chain_payload(
     pack_type: PackType,
-    data: Vec<u8>,
+    data: &[u8],
     compression_level: Option<u32>,
 ) -> Result<(u64, Vec<u8>)> {
     let raw_len = u64::try_from(data.len())
         .map_err(|_| Error::invalid("chain payload exceeds supported length"))?;
+    #[cfg(not(any(feature = "gzip", feature = "lz4", feature = "fastlz")))]
+    let _ = raw_len;
     if data.is_empty() {
-        return Ok((0, data));
+        return Ok((0, Vec::new()));
     }
 
     match pack_type {
-        PackType::None => Ok((0, data)),
+        PackType::None => Ok((0, data.to_vec())),
         PackType::Zlib => {
             #[cfg(not(feature = "gzip"))]
             {
@@ -316,11 +327,14 @@ pub fn encode_chain_payload(
             }
             #[cfg(feature = "gzip")]
             {
-                let compressed = zlib_compress(&data, compression_level)?;
+                if data.len() <= 32 {
+                    return Ok((0, data.to_vec()));
+                }
+                let compressed = zlib_compress(data, compression_level, 4)?;
                 if compressed.len() < data.len() {
                     return Ok((raw_len, compressed));
                 }
-                Ok((0, data))
+                Ok((0, data.to_vec()))
             }
         }
         PackType::Lz4 => {
@@ -332,11 +346,11 @@ pub fn encode_chain_payload(
             }
             #[cfg(feature = "lz4")]
             {
-                let compressed = lz4_compress(&data);
+                let compressed = lz4_compress(data);
                 if compressed.len() < data.len() {
                     return Ok((raw_len, compressed));
                 }
-                Ok((0, data))
+                Ok((0, data.to_vec()))
             }
         }
         PackType::FastLz => {
@@ -348,11 +362,11 @@ pub fn encode_chain_payload(
             }
             #[cfg(feature = "fastlz")]
             {
-                let compressed = fastlz_compress_bytes(&data)?;
+                let compressed = fastlz_compress_bytes(data)?;
                 if compressed.len() < data.len() {
                     return Ok((raw_len, compressed));
                 }
-                Ok((0, data))
+                Ok((0, data.to_vec()))
             }
         }
     }
@@ -429,9 +443,73 @@ pub fn encode_chain_index(entries: &[ChainIndexEntry]) -> Result<Vec<u8>> {
     Ok(index_bytes)
 }
 
+/// Serializes the compact signed index used by `FST_BL_VCDATA_DYN_ALIAS2` blocks.
+pub fn encode_chain_index_dyn_alias2(entries: &[ChainIndexEntry]) -> Result<Vec<u8>> {
+    const PACK_MARKER_PREFIX: u64 = 1;
+
+    let mut output = Vec::new();
+    let mut empty_run = 0usize;
+    let mut last_offset = 0u64;
+    let mut last_alias = None;
+
+    for entry in entries {
+        match entry {
+            ChainIndexEntry::Empty => {
+                empty_run += 1;
+            }
+            ChainIndexEntry::Data { offset } => {
+                if empty_run != 0 {
+                    encode_varint((empty_run as u64) << 1, &mut output);
+                    empty_run = 0;
+                }
+                let absolute = PACK_MARKER_PREFIX
+                    .checked_add(*offset)
+                    .ok_or_else(|| Error::invalid("chain offset overflowed pack marker base"))?;
+                let delta = absolute
+                    .checked_sub(last_offset)
+                    .ok_or_else(|| Error::invalid("chain offsets must be non-decreasing"))?;
+                let delta = i64::try_from(delta)
+                    .map_err(|_| Error::invalid("chain index delta exceeds i64 range"))?;
+                let encoded = delta
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| Error::invalid("chain index delta overflow"))?;
+                encode_svarint(encoded, &mut output);
+                last_offset = absolute;
+                last_alias = None;
+            }
+            ChainIndexEntry::Alias { target } => {
+                if *target == 0 {
+                    return Err(Error::invalid("alias handle must be greater than zero"));
+                }
+                if empty_run != 0 {
+                    encode_varint((empty_run as u64) << 1, &mut output);
+                    empty_run = 0;
+                }
+                if last_alias == Some(*target) {
+                    encode_svarint(1, &mut output);
+                } else {
+                    let signed_target = -i64::from(*target);
+                    let encoded = signed_target
+                        .checked_mul(2)
+                        .map(|value| value | 1)
+                        .ok_or_else(|| Error::invalid("alias index overflow"))?;
+                    encode_svarint(encoded, &mut output);
+                    last_alias = Some(*target);
+                }
+            }
+        }
+    }
+
+    if empty_run != 0 {
+        encode_varint((empty_run as u64) << 1, &mut output);
+    }
+    Ok(output)
+}
+
 #[cfg(feature = "gzip")]
-fn zlib_compress(input: &[u8], level: Option<u32>) -> Result<Vec<u8>> {
-    let lvl = level.map(|v| v.min(9)).unwrap_or(6);
+fn zlib_compress(input: &[u8], level: Option<u32>, default_level: u32) -> Result<Vec<u8>> {
+    let lvl = level.map(|v| v.min(9)).unwrap_or(default_level);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(lvl));
     encoder.write_all(input)?;
     Ok(encoder.finish()?)

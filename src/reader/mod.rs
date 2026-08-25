@@ -4,6 +4,9 @@
 
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 
+#[cfg(feature = "gzip")]
+use flate2::read::GzDecoder;
+
 use crate::block::{BlackoutBlock, GeomInfo, Header, HierarchyBlock};
 use crate::error::{Error, Result};
 use crate::io::{ReadSeek, ReaderBackend};
@@ -22,12 +25,21 @@ pub use change::{ValueChange, VcBlockChanges, build_changes};
 pub struct ReaderOptions {
     /// When `true`, geometry blocks are loaded eagerly as soon as they appear.
     pub eager_geometry: bool,
+    /// Maximum accepted uncompressed size for a whole-file gzip wrapper.
+    pub max_decompressed_bytes: u64,
+    /// Maximum accepted compressed or decoded size for an individual FST block.
+    pub max_block_bytes: u64,
+    /// Maximum number of canonical signal handles accepted from an input file.
+    pub max_handles: u64,
 }
 
 impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
             eager_geometry: true,
+            max_decompressed_bytes: 8 * 1024 * 1024 * 1024,
+            max_block_bytes: 4 * 1024 * 1024 * 1024,
+            max_handles: 16_777_216,
         }
     }
 }
@@ -59,6 +71,24 @@ impl<R: ReadSeek> ReaderBuilder<R> {
         self
     }
 
+    /// Sets the safety limit used before allocating for `FST_BL_ZWRAPPER`.
+    pub fn max_decompressed_bytes(mut self, bytes: u64) -> Self {
+        self.options.max_decompressed_bytes = bytes;
+        self
+    }
+
+    /// Sets the safety limit for individual block allocations and decompression.
+    pub fn max_block_bytes(mut self, bytes: u64) -> Self {
+        self.options.max_block_bytes = bytes;
+        self
+    }
+
+    /// Sets the maximum canonical signal-handle count accepted by the reader.
+    pub fn max_handles(mut self, handles: u64) -> Self {
+        self.options.max_handles = handles;
+        self
+    }
+
     /// Consumes the builder, constructing the reader.
     pub fn build(self) -> Result<FstReader<R>> {
         FstReader::with_backend(self.source, self.options)
@@ -77,9 +107,25 @@ pub struct FstReader<R: ReadSeek> {
 }
 
 impl<R: ReadSeek> FstReader<R> {
-    fn with_backend(source: R, options: ReaderOptions) -> Result<Self> {
-        let mut backend = ReaderBackend::new(source);
+    fn with_backend(mut source: R, options: ReaderOptions) -> Result<Self> {
+        source.seek(SeekFrom::Start(0))?;
+        let mut tag = [0u8; 1];
+        source.read_exact(&mut tag)?;
+        source.seek(SeekFrom::Start(0))?;
+
+        let mut backend = if tag[0] == BlockType::ZWrapper as u8 {
+            let decoded = decode_wrapper(&mut source, options.max_decompressed_bytes)?;
+            ReaderBackend::wrapped(source, decoded)
+        } else {
+            ReaderBackend::new(source)
+        };
         let header = Header::read(backend.get_mut())?;
+        if header.max_handle > options.max_handles {
+            return Err(Error::invalid(format!(
+                "header declares {} handles, above configured limit {}",
+                header.max_handle, options.max_handles
+            )));
+        }
         let mut reader = Self {
             backend,
             options,
@@ -133,11 +179,11 @@ impl<R: ReadSeek> FstReader<R> {
         self.backend.into_inner()
     }
 
-    /// Placeholder for future block iteration support.
+    /// Skips all remaining blocks and positions the source at end-of-file.
     pub fn skip_remaining(&mut self) -> Result<()> {
-        Err(Error::unsupported(
-            "block iteration not yet implemented in fst-format crate",
-        ))
+        self.current_vc_block = None;
+        self.backend.get_mut().seek(SeekFrom::End(0))?;
+        Ok(())
     }
 
     /// Returns metadata for the next value-change block, advancing the stream.
@@ -159,7 +205,15 @@ impl<R: ReadSeek> FstReader<R> {
                     let section_length = read_u64_be(reader)?;
                     let section_start = reader.stream_position()?;
                     let payload_len = payload_length(section_length)?;
-                    let meta = parse_vc_block(reader, block_type, section_start, payload_len)?;
+                    validate_block_size(section_length, self.options.max_block_bytes)?;
+                    let meta = parse_vc_block(
+                        reader,
+                        block_type,
+                        section_start,
+                        payload_len,
+                        self.options.max_block_bytes,
+                        self.options.max_handles,
+                    )?;
                     let block_end = section_start.checked_add(payload_len).ok_or_else(|| {
                         Error::invalid("value-change payload exceeds file bounds")
                     })?;
@@ -168,9 +222,15 @@ impl<R: ReadSeek> FstReader<R> {
                 }
                 BlockType::Geometry => {
                     let section_length = read_u64_be(reader)?;
+                    validate_block_size(section_length, self.options.max_block_bytes)?;
                     let payload_len = payload_length(section_length)?;
                     if self.options.eager_geometry || self.geometry.is_none() {
-                        let geom = Self::read_geometry_block(reader, section_length)?;
+                        let geom = Self::read_geometry_block(
+                            reader,
+                            section_length,
+                            self.options.max_block_bytes,
+                            self.options.max_handles,
+                        )?;
                         self.geometry = Some(geom);
                     } else {
                         skip_bytes(reader, payload_len)?;
@@ -178,6 +238,7 @@ impl<R: ReadSeek> FstReader<R> {
                 }
                 BlockType::Blackout => {
                     let section_length = read_u64_be(reader)?;
+                    validate_block_size(section_length, self.options.max_block_bytes)?;
                     let payload_len = payload_length(section_length)?;
                     let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
                         Error::invalid("blackout payload exceeds addressable memory")
@@ -187,7 +248,11 @@ impl<R: ReadSeek> FstReader<R> {
                     self.blackout = Some(BlackoutBlock::decode(&buf)?);
                 }
                 BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
-                    let hier = Self::read_hierarchy_block(reader, block_type)?;
+                    let hier = Self::read_hierarchy_block(
+                        reader,
+                        block_type,
+                        self.options.max_block_bytes,
+                    )?;
                     self.hierarchy = Some(hier);
                 }
                 BlockType::Skip => {
@@ -196,8 +261,8 @@ impl<R: ReadSeek> FstReader<R> {
                     skip_bytes(reader, payload_len)?;
                 }
                 BlockType::ZWrapper => {
-                    return Err(Error::unsupported(
-                        "zlib wrapper blocks are not yet supported",
+                    return Err(Error::invalid(
+                        "z-wrapper must be the first and only outer block",
                     ));
                 }
                 BlockType::Header => {
@@ -219,9 +284,8 @@ impl<R: ReadSeek> FstReader<R> {
         let geom = self.geometry.as_ref().ok_or_else(|| {
             Error::invalid("geometry metadata is required before iterating value changes")
         })?;
-        let time_zero = self.header.time_zero;
         let block_ref = self.current_vc_block.as_ref().expect("block just stored");
-        block_ref.changes(geom, time_zero).map(Some)
+        block_ref.changes(geom).map(Some)
     }
 
     fn parse_preamble(&mut self) -> Result<()> {
@@ -241,9 +305,15 @@ impl<R: ReadSeek> FstReader<R> {
             match block_type {
                 BlockType::Geometry => {
                     let section_length = read_u64_be(reader)?;
+                    validate_block_size(section_length, self.options.max_block_bytes)?;
                     let payload_len = payload_length(section_length)?;
                     if self.options.eager_geometry || self.geometry.is_none() {
-                        let geom = Self::read_geometry_block(reader, section_length)?;
+                        let geom = Self::read_geometry_block(
+                            reader,
+                            section_length,
+                            self.options.max_block_bytes,
+                            self.options.max_handles,
+                        )?;
                         self.geometry = Some(geom);
                     } else {
                         skip_bytes(reader, payload_len)?;
@@ -251,6 +321,7 @@ impl<R: ReadSeek> FstReader<R> {
                 }
                 BlockType::Blackout => {
                     let section_length = read_u64_be(reader)?;
+                    validate_block_size(section_length, self.options.max_block_bytes)?;
                     let payload_len = payload_length(section_length)?;
                     let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
                         Error::invalid("blackout payload exceeds addressable memory")
@@ -260,7 +331,11 @@ impl<R: ReadSeek> FstReader<R> {
                     self.blackout = Some(BlackoutBlock::decode(&buf)?);
                 }
                 BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
-                    let hier = Self::read_hierarchy_block(reader, block_type)?;
+                    let hier = Self::read_hierarchy_block(
+                        reader,
+                        block_type,
+                        self.options.max_block_bytes,
+                    )?;
                     self.hierarchy = Some(hier);
                 }
                 BlockType::Skip => {
@@ -273,8 +348,8 @@ impl<R: ReadSeek> FstReader<R> {
                     break;
                 }
                 BlockType::ZWrapper => {
-                    return Err(Error::unsupported(
-                        "zlib wrapper blocks are not yet supported",
+                    return Err(Error::invalid(
+                        "z-wrapper must be the first and only outer block",
                     ));
                 }
                 BlockType::Header => {
@@ -307,11 +382,18 @@ impl<R: ReadSeek> FstReader<R> {
                 }
                 BlockType::Geometry => {
                     let section_length = read_u64_be(reader)?;
-                    let geom = Self::read_geometry_block(reader, section_length)?;
+                    validate_block_size(section_length, self.options.max_block_bytes)?;
+                    let geom = Self::read_geometry_block(
+                        reader,
+                        section_length,
+                        self.options.max_block_bytes,
+                        self.options.max_handles,
+                    )?;
                     self.geometry = Some(geom);
                 }
                 BlockType::Blackout => {
                     let section_length = read_u64_be(reader)?;
+                    validate_block_size(section_length, self.options.max_block_bytes)?;
                     let payload_len = payload_length(section_length)?;
                     let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
                         Error::invalid("blackout payload exceeds addressable memory")
@@ -321,7 +403,11 @@ impl<R: ReadSeek> FstReader<R> {
                     self.blackout = Some(BlackoutBlock::decode(&buf)?);
                 }
                 BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
-                    let hier = Self::read_hierarchy_block(reader, block_type)?;
+                    let hier = Self::read_hierarchy_block(
+                        reader,
+                        block_type,
+                        self.options.max_block_bytes,
+                    )?;
                     self.hierarchy = Some(hier);
                 }
                 BlockType::Skip => {
@@ -330,8 +416,8 @@ impl<R: ReadSeek> FstReader<R> {
                     skip_bytes(reader, payload_len)?;
                 }
                 BlockType::ZWrapper => {
-                    return Err(Error::unsupported(
-                        "zlib wrapper blocks are not yet supported",
+                    return Err(Error::invalid(
+                        "z-wrapper must be the first and only outer block",
                     ));
                 }
                 BlockType::Header => {
@@ -344,20 +430,95 @@ impl<R: ReadSeek> FstReader<R> {
     fn read_geometry_block<Rd: Read + Seek>(
         reader: &mut Rd,
         section_length: u64,
+        max_block_bytes: u64,
+        max_handles: u64,
     ) -> Result<GeomInfo> {
+        let uncompressed_len = read_u64_be(reader)?;
+        if uncompressed_len > max_block_bytes {
+            return Err(Error::invalid(
+                "decoded geometry exceeds configured block limit",
+            ));
+        }
+        let max_handle = read_u64_be(reader)?;
+        if max_handle > max_handles {
+            return Err(Error::invalid(format!(
+                "geometry declares {max_handle} handles, above configured limit {max_handles}"
+            )));
+        }
+        reader.seek(SeekFrom::Current(-16))?;
         GeomInfo::decode_block(reader, section_length)
     }
 
     fn read_hierarchy_block<Rd: Read + Seek>(
         reader: &mut Rd,
         block_type: BlockType,
+        max_block_bytes: u64,
     ) -> Result<HierarchyBlock> {
         let section_length = read_u64_be(reader)?;
+        validate_block_size(section_length, max_block_bytes)?;
+        let uncompressed_len = read_u64_be(reader)?;
+        if uncompressed_len > max_block_bytes {
+            return Err(Error::invalid(
+                "decoded hierarchy exceeds configured block limit",
+            ));
+        }
+        reader.seek(SeekFrom::Current(-8))?;
         HierarchyBlock::decode_block(reader, block_type, section_length)
+    }
+}
+
+fn decode_wrapper<R: Read + Seek>(source: &mut R, max_decoded: u64) -> Result<Vec<u8>> {
+    source.seek(SeekFrom::Start(1))?;
+    let section_length = read_u64_be(source)?;
+    if section_length < 16 {
+        return Err(Error::invalid(
+            "z-wrapper section is shorter than its header",
+        ));
+    }
+    let uncompressed_len = read_u64_be(source)?;
+    if uncompressed_len > max_decoded {
+        return Err(Error::invalid(format!(
+            "z-wrapper expands to {uncompressed_len} bytes, above configured limit {max_decoded}"
+        )));
+    }
+    let expected = usize::try_from(uncompressed_len)
+        .map_err(|_| Error::invalid("z-wrapper output exceeds addressable memory"))?;
+    let compressed_len = section_length - 16;
+    let compressed_len = usize::try_from(compressed_len)
+        .map_err(|_| Error::invalid("z-wrapper payload exceeds addressable memory"))?;
+    let mut compressed = vec![0u8; compressed_len];
+    source.read_exact(&mut compressed)?;
+
+    #[cfg(feature = "gzip")]
+    {
+        let mut decoded = Vec::with_capacity(expected.min(16 * 1024 * 1024));
+        GzDecoder::new(compressed.as_slice())
+            .take(uncompressed_len.saturating_add(1))
+            .read_to_end(&mut decoded)?;
+        if decoded.len() != expected {
+            return Err(Error::decode("z-wrapper decompressed length mismatch"));
+        }
+        Ok(decoded)
+    }
+    #[cfg(not(feature = "gzip"))]
+    {
+        let _ = (compressed, expected);
+        Err(Error::unsupported(
+            "z-wrapper decompression requires the `gzip` feature",
+        ))
     }
 }
 fn payload_length(section_length: u64) -> Result<u64> {
     section_length
         .checked_sub(8)
         .ok_or_else(|| Error::invalid("section length shorter than required header"))
+}
+
+fn validate_block_size(section_length: u64, limit: u64) -> Result<()> {
+    if section_length > limit {
+        return Err(Error::invalid(format!(
+            "FST block is {section_length} bytes, above configured limit {limit}"
+        )));
+    }
+    Ok(())
 }

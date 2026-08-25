@@ -21,7 +21,7 @@ pub struct HierarchySnapshot {
     pub root_attributes: Vec<AttributeNode>,
 }
 
-/// Recursive scope representation matching the structure described in `doc/wavefst.md Section 6`.
+/// Recursive, owned scope representation suitable for serialization.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScopeNode {
     /// Scope classification (module, task, package, etc.).
@@ -79,7 +79,7 @@ pub struct VariableNode {
 /// Fully owned representation of a value change event suitable for JSON export.
 #[derive(Debug, Clone, Serialize)]
 pub struct OwnedValueChange {
-    /// Absolute simulation timestamp (already adjusted for `time_zero`).
+    /// Absolute simulation timestamp. `Header::time_zero` remains separate metadata.
     pub timestamp: u64,
     /// Handle of the signal that produced the change.
     pub handle: u32,

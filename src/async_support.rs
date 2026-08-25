@@ -134,6 +134,18 @@ impl<W> AsyncWriterBuilder<W> {
         self
     }
 
+    /// Bounds memory used by the synchronous block builder inside this async wrapper.
+    pub fn block_change_limit(mut self, limit: usize) -> Self {
+        self.options.block_change_limit = limit;
+        self
+    }
+
+    /// Sets the approximate queued payload byte limit for each VC block.
+    pub fn block_size_limit(mut self, bytes: usize) -> Self {
+        self.options.block_size_limit = bytes;
+        self
+    }
+
     /// Builds the async writer, validating options before returning the instance.
     pub fn build(self) -> Result<AsyncWriter<W>>
     where

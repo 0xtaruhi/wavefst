@@ -91,6 +91,7 @@ fn emit_sample_trace<W: wavefst::io::WriteSeek>(writer: &mut FstWriter<W>) {
 }
 
 fn bench_writer(c: &mut Criterion) {
+    #[allow(unused_mut, clippy::useless_vec)]
     let mut configs = vec![("raw", ChainCompression::Raw, TimeCompression::Raw)];
     #[cfg(feature = "gzip")]
     {
@@ -98,7 +99,12 @@ fn bench_writer(c: &mut Criterion) {
     }
     #[cfg(feature = "lz4")]
     {
-        configs.push(("lz4", ChainCompression::Lz4, TimeCompression::Zlib));
+        let time = if cfg!(feature = "gzip") {
+            TimeCompression::Zlib
+        } else {
+            TimeCompression::Raw
+        };
+        configs.push(("lz4", ChainCompression::Lz4, time));
     }
     #[cfg(feature = "fastlz")]
     {

@@ -1,9 +1,9 @@
 //! Incremental writer producing FST output streams.
 
 use crate::block::{
-    ChainIndexEntry, GeomEntry, GeomInfo, Header, HierarchyBlock, HierarchyCompression,
-    HierarchyItem, ScopeEntry, VarEntry, encode_chain_index, encode_chain_payload,
-    encode_frame_section, encode_time_section,
+    AttributeEntry, BlackoutBlock, BlackoutEvent, ChainIndexEntry, GeomEntry, GeomInfo, Header,
+    HierarchyBlock, HierarchyCompression, HierarchyItem, ScopeEntry, VarEntry, encode_chain_index,
+    encode_chain_index_dyn_alias2, encode_chain_payload, encode_frame_section, encode_time_section,
 };
 use crate::encoding::encode_varint;
 use crate::error::{Error, Result};
@@ -11,10 +11,12 @@ use crate::io::{WriteSeek, WriterBackend};
 use crate::types::{BlockType, PackType, ScopeType, SignalValue, VarDir, VarType};
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 
 #[cfg(feature = "gzip")]
 use flate2::{Compression, write::GzEncoder};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// Options controlling [`FstWriter`] behaviour.
 #[derive(Debug, Clone)]
@@ -29,6 +31,10 @@ pub struct WriterOptions {
     pub time_compression: TimeCompression,
     /// Wrap the entire file in an outer `FST_BL_ZWRAPPER` gzip envelope.
     pub wrap_zlib: bool,
+    /// Maximum queued changes before the current value-change block is flushed.
+    pub block_change_limit: usize,
+    /// Approximate payload bytes queued before a value-change block is flushed.
+    pub block_size_limit: usize,
 }
 
 /// Compression choice for the per-handle value-change payloads.
@@ -71,6 +77,8 @@ impl Default for WriterOptions {
             chain_compression,
             time_compression,
             wrap_zlib: false,
+            block_change_limit: 1_000_000,
+            block_size_limit: 64 * 1024 * 1024,
         }
     }
 }
@@ -120,6 +128,24 @@ impl<W: WriteSeek> WriterBuilder<W> {
         self
     }
 
+    /// Sets an algorithm-specific compression level, clamped to each backend's range.
+    pub fn compression_level(mut self, level: Option<u32>) -> Self {
+        self.options.compression_level = level;
+        self
+    }
+
+    /// Bounds memory use by flushing after this many queued value changes.
+    pub fn block_change_limit(mut self, limit: usize) -> Self {
+        self.options.block_change_limit = limit;
+        self
+    }
+
+    /// Bounds queued value payload memory and the target size of generated VC blocks.
+    pub fn block_size_limit(mut self, bytes: usize) -> Self {
+        self.options.block_size_limit = bytes;
+        self
+    }
+
     /// Builds the writer, validating options before returning the instance.
     pub fn build(self) -> Result<FstWriter<W>> {
         FstWriter::with_backend(self.sink, self.options)
@@ -127,6 +153,11 @@ impl<W: WriteSeek> WriterBuilder<W> {
 }
 
 fn validate_options(options: &WriterOptions) -> Result<()> {
+    if options.block_change_limit == 0 || options.block_size_limit == 0 {
+        return Err(Error::invalid(
+            "writer block limits must be greater than zero",
+        ));
+    }
     match options.chain_compression {
         ChainCompression::Raw => {}
         ChainCompression::Zlib => {
@@ -176,7 +207,16 @@ fn validate_options(options: &WriterOptions) -> Result<()> {
         }
     }
 
-    Ok(())
+    #[cfg(any(feature = "gzip", feature = "lz4"))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(feature = "gzip", feature = "lz4")))]
+    {
+        Err(Error::unsupported(
+            "writing a self-contained FST requires the `gzip` or `lz4` feature for hierarchy data",
+        ))
+    }
 }
 
 /// Streaming writer for FST files.
@@ -228,6 +268,17 @@ impl<W: WriteSeek> OutputBackend<W> {
         f(self.writer_mut())
     }
 
+    fn seek(&mut self, position: SeekFrom) -> Result<u64> {
+        Ok(match self {
+            OutputBackend::Direct(backend) => backend.get_mut().seek(position)?,
+            OutputBackend::Wrapped { buffer, .. } => buffer.get_mut().seek(position)?,
+        })
+    }
+
+    fn stream_position(&mut self) -> Result<u64> {
+        self.seek(SeekFrom::Current(0))
+    }
+
     fn into_inner(self, options: &WriterOptions) -> Result<W> {
         match self {
             OutputBackend::Direct(backend) => Ok(backend.into_inner()?),
@@ -237,10 +288,10 @@ impl<W: WriteSeek> OutputBackend<W> {
                 let inner = cursor.into_inner();
                 #[cfg(not(feature = "gzip"))]
                 {
-                    let _ = (inner, options);
-                    return Err(Error::unsupported(
+                    let _ = (inner, options, sink);
+                    Err(Error::unsupported(
                         "file-level zlib wrapper requires the `gzip` feature",
-                    ));
+                    ))
                 }
                 #[cfg(feature = "gzip")]
                 {
@@ -252,16 +303,12 @@ impl<W: WriteSeek> OutputBackend<W> {
                     );
                     encoder.write_all(&inner)?;
                     let compressed = encoder.finish()?;
-                    let payload_len = u64::try_from(compressed.len()).map_err(|_| {
-                        Error::invalid("z-wrapper payload exceeds supported length")
-                    })?;
                     let uncompressed_len = u64::try_from(inner.len()).map_err(|_| {
                         Error::invalid("z-wrapper uncompressed payload exceeds supported length")
                     })?;
 
-                    let mut payload = Vec::with_capacity(compressed.len() + 16);
+                    let mut payload = Vec::with_capacity(compressed.len() + 8);
                     payload.extend_from_slice(&uncompressed_len.to_be_bytes());
-                    payload.extend_from_slice(&payload_len.to_be_bytes());
                     payload.extend_from_slice(&compressed);
 
                     let section_length = u64::try_from(payload.len())
@@ -294,14 +341,22 @@ pub struct FstWriter<W: WriteSeek> {
     scopes: Vec<ScopeEntry>,
     variables: Vec<VarEntry>,
     hierarchy_items: Vec<HierarchyItem>,
+    attributes: Vec<AttributeEntry>,
+    attribute_depth: usize,
     scope_stack: Vec<usize>,
     geometry: Vec<GeomEntry>,
-    alias_of: Vec<Option<u32>>,
-    alias_children: Vec<Vec<u32>>,
     next_handle: u32,
     header: Option<Header>,
-    pending_changes: Vec<PendingChange>,
+    pending_chains: Vec<PendingChain>,
+    pending_times: Vec<u64>,
+    pending_time_data: Vec<u8>,
+    pending_change_count: usize,
+    pending_bytes: usize,
     vc_blocks_written: u64,
+    first_change_time: Option<u64>,
+    last_change_time: Option<u64>,
+    blackout_events: Vec<BlackoutEvent>,
+    blackout_written: bool,
 }
 
 impl<W: WriteSeek> FstWriter<W> {
@@ -321,14 +376,22 @@ impl<W: WriteSeek> FstWriter<W> {
             scopes: Vec::new(),
             variables: Vec::new(),
             hierarchy_items: Vec::new(),
+            attributes: Vec::new(),
+            attribute_depth: 0,
             scope_stack: Vec::new(),
             geometry: Vec::new(),
-            alias_of: Vec::new(),
-            alias_children: Vec::new(),
             next_handle: 1,
             header: None,
-            pending_changes: Vec::new(),
+            pending_chains: Vec::new(),
+            pending_times: Vec::new(),
+            pending_time_data: Vec::new(),
+            pending_change_count: 0,
+            pending_bytes: 0,
             vc_blocks_written: 0,
+            first_change_time: None,
+            last_change_time: None,
+            blackout_events: Vec::new(),
+            blackout_written: false,
         })
     }
 
@@ -337,8 +400,7 @@ impl<W: WriteSeek> FstWriter<W> {
         WriterBuilder::new(sink)
     }
 
-    /// Writes the FST header block. This implementation currently emits a minimal header and is
-    /// intended as a starting point for further development.
+    /// Writes the FST header and declaration blocks.
     pub fn write_header(&mut self, mut header: Header) -> Result<()> {
         if self.header_written {
             return Err(Error::unsupported("header already written"));
@@ -348,16 +410,27 @@ impl<W: WriteSeek> FstWriter<W> {
                 "cannot write header while scopes remain open; call `end_scope` first",
             ));
         }
+        if self.attribute_depth != 0 {
+            return Err(Error::invalid(
+                "cannot write header while hierarchy attributes remain open",
+            ));
+        }
 
-        header.scope_count = self.scopes.len() as u64;
-        header.var_count = self.variables.len() as u64;
-        header.max_handle = self.next_handle.saturating_sub(1) as u64;
+        header.scope_count = u64::try_from(self.scopes.len())
+            .map_err(|_| Error::invalid("scope count exceeds u64"))?;
+        header.var_count = u64::try_from(self.variables.len())
+            .map_err(|_| Error::invalid("variable count exceeds u64"))?;
+        header.max_handle = u64::try_from(self.geometry.len())
+            .map_err(|_| Error::invalid("handle count exceeds u64"))?;
         header.timescale_exponent = self.options.timescale_exponent;
         header.section_length = 329;
 
         self.write_header_block(&header)?;
-        self.write_geometry_block(false)?;
+        self.write_geometry_block(cfg!(feature = "gzip"))?;
         self.write_hierarchy_block()?;
+
+        self.pending_chains
+            .resize_with(self.geometry.len(), PendingChain::default);
 
         self.header_written = true;
         self.metadata_written = true;
@@ -373,10 +446,15 @@ impl<W: WriteSeek> FstWriter<W> {
         component: Option<String>,
     ) -> Result<ScopeId> {
         self.ensure_metadata_mutable()?;
+        let name = name.into();
+        validate_hierarchy_text("scope name", &name)?;
+        if let Some(component) = &component {
+            validate_hierarchy_text("scope component", component)?;
+        }
         let parent = self.scope_stack.last().copied();
         let scope = ScopeEntry {
             scope_type,
-            name: name.into(),
+            name,
             component,
             parent,
         };
@@ -398,6 +476,39 @@ impl<W: WriteSeek> FstWriter<W> {
         Ok(())
     }
 
+    /// Emits a self-contained hierarchy attribute (for example a comment or source stem).
+    pub fn add_attribute(
+        &mut self,
+        attr_type: u8,
+        subtype: u8,
+        name: impl Into<String>,
+        argument: u64,
+    ) -> Result<AttributeId> {
+        self.push_attribute(attr_type, subtype, name.into(), argument, false)
+    }
+
+    /// Begins a hierarchy attribute that will be closed by [`end_attribute`](Self::end_attribute).
+    pub fn begin_attribute(
+        &mut self,
+        attr_type: u8,
+        subtype: u8,
+        name: impl Into<String>,
+        argument: u64,
+    ) -> Result<AttributeId> {
+        self.push_attribute(attr_type, subtype, name.into(), argument, true)
+    }
+
+    /// Closes the most recently begun hierarchy attribute.
+    pub fn end_attribute(&mut self) -> Result<()> {
+        self.ensure_metadata_mutable()?;
+        if self.attribute_depth == 0 {
+            return Err(Error::invalid("hierarchy attribute stack underflow"));
+        }
+        self.attribute_depth -= 1;
+        self.hierarchy_items.push(HierarchyItem::AttributeEnd);
+        Ok(())
+    }
+
     /// Declares a variable within the currently active scope. Returns the newly allocated handle.
     pub fn add_variable(
         &mut self,
@@ -407,6 +518,9 @@ impl<W: WriteSeek> FstWriter<W> {
         geometry: GeomEntry,
     ) -> Result<u32> {
         self.ensure_metadata_mutable()?;
+        validate_geometry(var_type, &geometry)?;
+        let name = name.into();
+        validate_hierarchy_text("variable name", &name)?;
         let scope = self
             .scope_stack
             .last()
@@ -421,16 +535,15 @@ impl<W: WriteSeek> FstWriter<W> {
 
         let length = match geometry {
             GeomEntry::Fixed(bytes) => Some(bytes),
-            GeomEntry::Real | GeomEntry::Variable => None,
+            GeomEntry::Real => Some(8),
+            GeomEntry::Variable => None,
         };
 
         self.geometry.push(geometry);
-        self.alias_of.push(None);
-        self.alias_children.push(Vec::new());
         self.variables.push(VarEntry {
             var_type,
             direction,
-            name: name.into(),
+            name,
             length,
             handle,
             alias_of: None,
@@ -446,7 +559,8 @@ impl<W: WriteSeek> FstWriter<W> {
         Ok(handle)
     }
 
-    /// Declares an alias that reuses the value stream of an existing handle.
+    /// Declares an alias that reuses an existing handle. FST aliases do not allocate a new handle;
+    /// the returned value is therefore exactly `target_handle`.
     pub fn add_alias(
         &mut self,
         var_type: VarType,
@@ -455,6 +569,8 @@ impl<W: WriteSeek> FstWriter<W> {
         target_handle: u32,
     ) -> Result<u32> {
         self.ensure_metadata_mutable()?;
+        let name = name.into();
+        validate_hierarchy_text("alias name", &name)?;
         if target_handle == 0 || target_handle >= self.next_handle {
             return Err(Error::invalid(format!(
                 "alias target handle {target_handle} is out of range (max {})",
@@ -468,49 +584,32 @@ impl<W: WriteSeek> FstWriter<W> {
             .copied()
             .ok_or_else(|| Error::invalid("aliases require an active scope"))?;
 
-        let canonical = self.resolve_canonical_handle(target_handle)?;
-        let target_index = (canonical - 1) as usize;
+        let target_index = (target_handle - 1) as usize;
         let geometry = self.geometry.get(target_index).cloned().ok_or_else(|| {
             Error::invalid(format!(
-                "no geometry recorded for canonical handle {canonical}"
+                "no geometry recorded for target handle {target_handle}"
             ))
         })?;
-
-        let handle = self.next_handle;
-        self.next_handle = self
-            .next_handle
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid("handle counter overflow"))?;
-
-        self.geometry.push(geometry.clone());
-        self.alias_of.push(Some(canonical));
-        self.alias_children.push(Vec::new());
-
-        let canonical_index = (canonical - 1) as usize;
-        if let Some(children) = self.alias_children.get_mut(canonical_index) {
-            children.push(handle);
-        }
+        validate_geometry(var_type, &geometry)?;
 
         self.variables.push(VarEntry {
             var_type,
             direction,
-            name: name.into(),
+            name,
             length: match geometry {
                 GeomEntry::Fixed(bytes) => Some(bytes),
-                GeomEntry::Real | GeomEntry::Variable => None,
+                GeomEntry::Real => Some(8),
+                GeomEntry::Variable => None,
             },
-            handle,
-            alias_of: Some(canonical),
+            handle: target_handle,
+            alias_of: Some(target_handle),
             scope: Some(scope),
             is_alias: true,
         });
         let var_index = self.variables.len() - 1;
         self.hierarchy_items.push(HierarchyItem::Var { var_index });
 
-        self.frame_state.register_handle(handle, &geometry);
-        self.frame_state.clone_from(canonical, handle)?;
-
-        Ok(handle)
+        Ok(target_handle)
     }
 
     /// Records a value change that will be emitted in the next value-change block.
@@ -532,40 +631,117 @@ impl<W: WriteSeek> FstWriter<W> {
             )));
         }
 
-        let canonical = self.resolve_canonical_handle(handle)?;
-        let geom_index = (canonical - 1) as usize;
-        let geom_entry = self.geometry.get(geom_index).ok_or_else(|| {
-            Error::invalid(format!(
-                "no geometry recorded for canonical handle {canonical}"
-            ))
-        })?;
-        let owned_value = Self::convert_value(value, geom_entry)?;
-
-        self.pending_changes.push(PendingChange {
-            timestamp,
-            handle: canonical,
-            value: owned_value.clone(),
-        });
-        self.frame_state.update(canonical, &owned_value)?;
-        if let Some(children) = self.alias_children.get((canonical - 1) as usize) {
-            for &alias in children {
-                self.frame_state.update(alias, &owned_value)?;
-            }
+        if let Some(previous) = self.last_change_time
+            && timestamp < previous
+        {
+            return Err(Error::invalid(format!(
+                "timestamps must be monotonic: {timestamp} follows {previous}"
+            )));
         }
 
+        let geom_index = (handle - 1) as usize;
+        let geom_entry = self
+            .geometry
+            .get(geom_index)
+            .ok_or_else(|| Error::invalid(format!("no geometry recorded for handle {handle}")))?;
+        let owned_value = Self::convert_value(value, geom_entry)?;
+        let value_size = owned_value.memory_size();
+
+        if self.pending_change_count != 0
+            && self.pending_bytes.saturating_add(value_size) > self.options.block_size_limit
+        {
+            self.flush_value_changes()?;
+        }
+
+        let time_index = if self.pending_times.last().copied() == Some(timestamp) {
+            self.pending_times.len() - 1
+        } else {
+            let delta = match self.pending_times.last().copied() {
+                Some(previous) => timestamp
+                    .checked_sub(previous)
+                    .ok_or_else(|| Error::invalid("timestamps must be non-decreasing"))?,
+                None => timestamp,
+            };
+            encode_varint(delta, &mut self.pending_time_data);
+            self.pending_times.push(timestamp);
+            self.pending_times.len() - 1
+        };
+
+        let chain = self
+            .pending_chains
+            .get_mut(geom_index)
+            .ok_or_else(|| Error::invalid(format!("no pending chain for handle {handle}")))?;
+        let delta = match chain.last_time_index {
+            Some(previous) => time_index
+                .checked_sub(previous)
+                .ok_or_else(|| Error::invalid("time indices must be non-decreasing"))?,
+            None => time_index,
+        };
+        let old_len = chain.data.len();
+        encode_owned_value(&owned_value, delta, &mut chain.data)?;
+        chain.last_time_index = Some(time_index);
+        chain.latest_value = Some(owned_value);
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(chain.data.len().saturating_sub(old_len));
+        self.pending_change_count = self.pending_change_count.saturating_add(1);
+        self.first_change_time.get_or_insert(timestamp);
+        self.last_change_time = Some(timestamp);
+
+        if self.pending_change_count >= self.options.block_change_limit
+            || self.pending_bytes >= self.options.block_size_limit
+        {
+            self.flush_value_changes()?;
+        }
+
+        Ok(())
+    }
+
+    /// Records a `$dumpon`/`$dumpoff` transition for the blackout block.
+    pub fn emit_dump_active(&mut self, timestamp: u64, is_on: bool) -> Result<()> {
+        if !self.header_written {
+            return Err(Error::invalid(
+                "dump activity cannot be emitted before the header is written",
+            ));
+        }
+        if self.blackout_written {
+            return Err(Error::invalid("blackout block has already been finalized"));
+        }
+        if let Some(previous) = self.last_change_time
+            && timestamp < previous
+        {
+            return Err(Error::invalid(format!(
+                "timestamps must be monotonic: {timestamp} follows {previous}"
+            )));
+        }
+        self.blackout_events.push(BlackoutEvent {
+            is_on,
+            time: timestamp,
+        });
+        self.first_change_time.get_or_insert(timestamp);
+        self.last_change_time = Some(timestamp);
         Ok(())
     }
 
     /// Flushes any buffered data to the sink.
     pub fn flush(&mut self) -> Result<()> {
         self.flush_value_changes()?;
+        self.patch_header_statistics()?;
         self.output.flush()?;
         Ok(())
     }
 
     /// Consumes the writer, returning the underlying sink once buffered data has been flushed.
     pub fn finish(mut self) -> Result<W> {
-        self.flush()?;
+        if !self.header_written {
+            return Err(Error::invalid(
+                "cannot finish an FST stream before writing its header",
+            ));
+        }
+        self.flush_value_changes()?;
+        self.write_blackout_block()?;
+        self.patch_header_statistics()?;
+        self.output.flush()?;
         self.output.into_inner(&self.options)
     }
 
@@ -579,30 +755,34 @@ impl<W: WriteSeek> FstWriter<W> {
         }
     }
 
-    fn resolve_canonical_handle(&self, mut handle: u32) -> Result<u32> {
-        if handle == 0 || handle >= self.next_handle {
-            return Err(Error::invalid(format!(
-                "handle {handle} is out of range (max {})",
-                self.next_handle - 1
-            )));
+    fn push_attribute(
+        &mut self,
+        attr_type: u8,
+        subtype: u8,
+        name: String,
+        argument: u64,
+        nested: bool,
+    ) -> Result<AttributeId> {
+        self.ensure_metadata_mutable()?;
+        validate_hierarchy_text("attribute name", &name)?;
+        let index = self.attributes.len();
+        self.attributes.push(AttributeEntry {
+            attr_type,
+            subtype,
+            name,
+            argument,
+            scope: self.scope_stack.last().copied(),
+        });
+        self.hierarchy_items.push(HierarchyItem::AttributeBegin {
+            attribute_index: index,
+        });
+        if nested {
+            self.attribute_depth = self
+                .attribute_depth
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid("hierarchy attribute depth overflow"))?;
         }
-        let limit = self.next_handle as usize;
-        for _ in 0..limit {
-            let alias = self
-                .alias_of
-                .get((handle - 1) as usize)
-                .and_then(|entry| *entry);
-            match alias {
-                Some(target) if target != handle => {
-                    handle = target;
-                }
-                Some(_) => {
-                    return Err(Error::invalid("alias handle cannot refer to itself"));
-                }
-                None => return Ok(handle),
-            }
-        }
-        Err(Error::invalid("alias resolution cycle detected"))
+        Ok(AttributeId(index))
     }
 
     fn convert_value(value: SignalValue<'_>, geom: &GeomEntry) -> Result<OwnedValue> {
@@ -621,11 +801,8 @@ impl<W: WriteSeek> FstWriter<W> {
                     Ok(OwnedValue::Bit(BitValue::from_char(ch)?))
                 }
                 SignalValue::PackedBits { width: 1, bits } => {
-                    let byte = bits
-                        .as_ref()
-                        .first()
-                        .copied()
-                        .ok_or_else(|| Error::invalid("packed bit payload is empty"))?;
+                    let normalized = normalize_packed_bits(1, bits.as_ref())?;
+                    let byte = normalized[0];
                     let ch = if (byte & 0x80) != 0 { '1' } else { '0' };
                     Ok(OwnedValue::Bit(BitValue::from_char(ch)?))
                 }
@@ -728,17 +905,28 @@ impl<W: WriteSeek> FstWriter<W> {
     }
 
     fn flush_value_changes(&mut self) -> Result<()> {
-        if self.pending_changes.is_empty() {
+        if self.pending_change_count == 0 {
             return Ok(());
         }
-        let changes = std::mem::take(&mut self.pending_changes);
-        let payload = self.build_vc_block(changes)?;
+        let (block_type, payload) = self.build_vc_block()?;
         let section_length = (payload.len() as u64)
             .checked_add(8)
             .ok_or_else(|| Error::invalid("value-change block length overflow"))?;
-        self.output.write_all(&[BlockType::VcData as u8])?;
+        self.output.write_all(&[block_type as u8])?;
         self.output.write_all(&section_length.to_be_bytes())?;
         self.output.write_all(&payload)?;
+
+        for (handle_index, chain) in self.pending_chains.iter_mut().enumerate() {
+            if let Some(value) = chain.latest_value.take() {
+                self.frame_state.update((handle_index + 1) as u32, &value)?;
+            }
+            chain.data.clear();
+            chain.last_time_index = None;
+        }
+        self.pending_times.clear();
+        self.pending_time_data.clear();
+        self.pending_change_count = 0;
+        self.pending_bytes = 0;
         self.vc_blocks_written = self
             .vc_blocks_written
             .checked_add(1)
@@ -746,37 +934,75 @@ impl<W: WriteSeek> FstWriter<W> {
         Ok(())
     }
 
-    fn build_vc_block(&mut self, mut changes: Vec<PendingChange>) -> Result<Vec<u8>> {
-        if changes.is_empty() {
+    fn patch_header_statistics(&mut self) -> Result<()> {
+        if !self.header_written {
+            return Ok(());
+        }
+
+        let end_position = self.output.stream_position()?;
+        let header = self
+            .header
+            .as_mut()
+            .ok_or_else(|| Error::invalid("header state missing after write"))?;
+        if let Some(start) = self.first_change_time {
+            header.start_time = start;
+        }
+        if let Some(end) = self.last_change_time {
+            header.end_time = end;
+        }
+        header.vc_section_count = self.vc_blocks_written;
+        header.scope_count = u64::try_from(self.scopes.len())
+            .map_err(|_| Error::invalid("scope count exceeds u64"))?;
+        header.var_count = u64::try_from(self.variables.len())
+            .map_err(|_| Error::invalid("variable count exceeds u64"))?;
+        header.max_handle = u64::try_from(self.geometry.len())
+            .map_err(|_| Error::invalid("handle count exceeds u64"))?;
+
+        self.output.seek(SeekFrom::Start(9))?;
+        self.output.write_all(&header.start_time.to_be_bytes())?;
+        self.output.write_all(&header.end_time.to_be_bytes())?;
+        self.output.seek(SeekFrom::Start(41))?;
+        self.output.write_all(&header.scope_count.to_be_bytes())?;
+        self.output.write_all(&header.var_count.to_be_bytes())?;
+        self.output.write_all(&header.max_handle.to_be_bytes())?;
+        self.output
+            .write_all(&header.vc_section_count.to_be_bytes())?;
+        self.output.seek(SeekFrom::Start(end_position))?;
+        Ok(())
+    }
+
+    fn write_blackout_block(&mut self) -> Result<()> {
+        if self.blackout_written || self.blackout_events.is_empty() {
+            return Ok(());
+        }
+        let mut payload = Vec::new();
+        BlackoutBlock {
+            events: self.blackout_events.clone(),
+        }
+        .encode(&mut payload)?;
+        let section_length = u64::try_from(payload.len())
+            .map_err(|_| Error::invalid("blackout block exceeds supported length"))?
+            .checked_add(8)
+            .ok_or_else(|| Error::invalid("blackout section length overflow"))?;
+        self.output.write_all(&[BlockType::Blackout as u8])?;
+        self.output.write_all(&section_length.to_be_bytes())?;
+        self.output.write_all(&payload)?;
+        self.blackout_written = true;
+        Ok(())
+    }
+
+    fn build_vc_block(&self) -> Result<(BlockType, Vec<u8>)> {
+        if self.pending_change_count == 0 || self.pending_times.is_empty() {
             return Err(Error::invalid(
                 "attempted to build a value-change block with no pending changes",
             ));
         }
-
-        changes.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.handle.cmp(&b.handle)));
 
         let max_handle = self.next_handle.saturating_sub(1);
         if max_handle == 0 {
             return Err(Error::invalid(
                 "no handles defined; unable to encode value-change block",
             ));
-        }
-
-        let mut time_points: Vec<u64> = Vec::new();
-        for change in &changes {
-            if time_points.last().copied() != Some(change.timestamp) {
-                time_points.push(change.timestamp);
-            }
-        }
-        if time_points.is_empty() {
-            return Err(Error::invalid(
-                "value-change block requires at least one timestamp",
-            ));
-        }
-
-        let mut time_index = HashMap::with_capacity(time_points.len());
-        for (idx, ts) in time_points.iter().enumerate() {
-            time_index.insert(*ts, idx);
         }
 
         let frame_bytes = self
@@ -789,155 +1015,113 @@ impl<W: WriteSeek> FstWriter<W> {
             0
         };
 
-        let mut required_memory = frame_encoding.uncompressed_len;
-
-        let mut per_handle: Vec<Vec<(usize, OwnedValue)>> = vec![Vec::new(); max_handle as usize];
-        for change in &changes {
-            let idx = *time_index
-                .get(&change.timestamp)
-                .ok_or_else(|| Error::invalid("internal time index map inconsistency"))?;
-            per_handle[(change.handle - 1) as usize].push((idx, change.value.clone()));
-        }
-
         let pack_type = self.chain_pack_type();
+        let mut required_memory = 0u64;
+        let mut chain_buffer = Vec::with_capacity(self.pending_bytes);
+        let mut index_entries = Vec::with_capacity(self.pending_chains.len());
+        let mut canonical_chains: HashMap<&[u8], u32> = HashMap::new();
+        let mut canonical_payloads = Vec::new();
+        let mut has_dynamic_aliases = false;
 
-        let mut chain_buffer = Vec::new();
-        let mut chain_offsets: Vec<Option<u64>> = vec![None; max_handle as usize];
-
-        for (handle_idx, events) in per_handle.iter().enumerate() {
-            if events.is_empty() {
+        for (handle_index, chain) in self.pending_chains.iter().enumerate() {
+            if chain.data.is_empty() {
+                index_entries.push(ChainIndexEntry::Empty);
                 continue;
             }
 
-            let mut chain_bytes = Vec::with_capacity(events.len() * 2);
-            let mut previous_index: Option<usize> = None;
-            for (time_idx_ref, value) in events.iter() {
-                let time_idx = *time_idx_ref;
-                let delta = match previous_index {
-                    Some(prev) => time_idx
-                        .checked_sub(prev)
-                        .ok_or_else(|| Error::invalid("time indices must be non-decreasing"))?,
-                    None => time_idx,
-                };
-                previous_index = Some(time_idx);
-                match value {
-                    OwnedValue::Bit(bit) => {
-                        let marker = bit.encode_marker(delta)?;
-                        encode_varint(marker, &mut chain_bytes);
-                    }
-                    OwnedValue::Vector {
-                        width,
-                        packed,
-                        data,
-                    } => {
-                        let delta_u64 = u64::try_from(delta)
-                            .map_err(|_| Error::invalid("time delta exceeds u64 range"))?;
-                        let width = *width;
-                        if let Some(bits) = packed {
-                            let expected = packed_len(width);
-                            if bits.len() != expected {
-                                return Err(Error::invalid(
-                                    "packed vector payload length mismatch",
-                                ));
-                            }
-                            let marker = delta_u64 << 1;
-                            encode_varint(marker, &mut chain_bytes);
-                            chain_bytes.extend_from_slice(bits);
-                        } else {
-                            if data.len() != width as usize {
-                                return Err(Error::invalid(
-                                    "vector payload length mismatch with geometry",
-                                ));
-                            }
-                            let marker = (delta_u64 << 1) | 1;
-                            encode_varint(marker, &mut chain_bytes);
-                            chain_bytes.extend_from_slice(data);
-                        }
-                    }
-                    OwnedValue::Real(value) => {
-                        let delta_u64 = u64::try_from(delta)
-                            .map_err(|_| Error::invalid("time delta exceeds u64 range"))?;
-                        let marker = (delta_u64 << 1) | 1;
-                        encode_varint(marker, &mut chain_bytes);
-                        let bytes = if cfg!(target_endian = "little") {
-                            value.to_le_bytes()
-                        } else {
-                            value.to_be_bytes()
-                        };
-                        chain_bytes.extend_from_slice(&bytes);
-                    }
-                    OwnedValue::VarLen(bytes) => {
-                        let delta_u64 = u64::try_from(delta)
-                            .map_err(|_| Error::invalid("time delta exceeds u64 range"))?;
-                        let marker = delta_u64 << 1;
-                        encode_varint(marker, &mut chain_bytes);
-                        let len_u64 = u64::try_from(bytes.len()).map_err(|_| {
-                            Error::invalid("variable-length payload exceeds u64 range")
-                        })?;
-                        encode_varint(len_u64, &mut chain_bytes);
-                        chain_bytes.extend_from_slice(bytes);
-                    }
-                }
-            }
-
-            let raw_len = u64::try_from(chain_bytes.len())
+            let raw_len = u64::try_from(chain.data.len())
                 .map_err(|_| Error::invalid("chain payload exceeds supported length"))?;
             required_memory = required_memory
                 .checked_add(raw_len)
                 .ok_or_else(|| Error::invalid("chain memory requirement overflow"))?;
 
-            let (stored_len, payload_bytes) =
-                encode_chain_payload(pack_type, chain_bytes, self.options.compression_level)?;
+            if let Some(&target) = canonical_chains.get(chain.data.as_slice()) {
+                index_entries.push(ChainIndexEntry::Alias { target });
+                has_dynamic_aliases = true;
+                continue;
+            }
 
-            let offset = chain_buffer.len() as u64;
-            encode_varint(stored_len, &mut chain_buffer);
-            chain_buffer.extend_from_slice(&payload_bytes);
-            chain_offsets[handle_idx] = Some(offset);
+            let handle = u32::try_from(handle_index + 1)
+                .map_err(|_| Error::invalid("handle exceeds u32 range"))?;
+            canonical_chains.insert(chain.data.as_slice(), handle);
+            canonical_payloads.push(chain.data.as_slice());
+            index_entries.push(ChainIndexEntry::Data { offset: 0 });
         }
 
-        let mut index_entries = Vec::with_capacity(chain_offsets.len());
-        for (handle_idx, offset) in chain_offsets.iter().enumerate() {
-            if let Some(Some(target)) = self.alias_of.get(handle_idx) {
-                index_entries.push(ChainIndexEntry::Alias { target: *target });
-            } else if let Some(offset) = offset {
-                index_entries.push(ChainIndexEntry::Data { offset: *offset });
+        let chain_compression = self.options.chain_compression;
+        let compression_level = self.options.compression_level;
+        let encode_payload = |data: &&[u8]| -> Result<(u64, Vec<u8>)> {
+            let data = *data;
+            if chain_compression == ChainCompression::Raw {
+                Ok((0, data.to_vec()))
             } else {
-                index_entries.push(ChainIndexEntry::Empty);
+                encode_chain_payload(pack_type, data, compression_level)
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        let encoded_payloads: Vec<(u64, Vec<u8>)> = {
+            let canonical_bytes: usize = canonical_payloads.iter().map(|data| data.len()).sum();
+            if canonical_payloads.len() >= 32 && canonical_bytes >= 64 * 1024 {
+                canonical_payloads
+                    .par_iter()
+                    .map(encode_payload)
+                    .collect::<Result<_>>()?
+            } else {
+                canonical_payloads
+                    .iter()
+                    .map(encode_payload)
+                    .collect::<Result<_>>()?
+            }
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let encoded_payloads: Vec<(u64, Vec<u8>)> = canonical_payloads
+            .iter()
+            .map(encode_payload)
+            .collect::<Result<_>>()?;
+
+        let mut encoded_payloads = encoded_payloads.into_iter();
+        for entry in &mut index_entries {
+            if let ChainIndexEntry::Data { offset } = entry {
+                let (stored_len, payload_bytes) = encoded_payloads
+                    .next()
+                    .ok_or_else(|| Error::invalid("missing encoded chain payload"))?;
+                *offset = u64::try_from(chain_buffer.len())
+                    .map_err(|_| Error::invalid("chain buffer exceeds u64 range"))?;
+                encode_varint(stored_len, &mut chain_buffer);
+                chain_buffer.extend_from_slice(&payload_bytes);
             }
         }
 
-        let index_bytes = encode_chain_index(&index_entries)?;
-
+        let index_bytes = if has_dynamic_aliases {
+            encode_chain_index_dyn_alias2(&index_entries)?
+        } else {
+            encode_chain_index(&index_entries)?
+        };
         let index_length = u64::try_from(index_bytes.len())
             .map_err(|_| Error::invalid("index length exceeds supported range"))?;
-
-        let mut time_data = Vec::with_capacity(time_points.len() * 2);
-        let mut prev_time = 0u64;
-        for (idx, ts) in time_points.iter().enumerate() {
-            let delta = if idx == 0 {
-                *ts
-            } else {
-                ts.checked_sub(prev_time)
-                    .ok_or_else(|| Error::invalid("timestamps must be non-decreasing"))?
-            };
-            prev_time = *ts;
-            encode_varint(delta, &mut time_data);
-        }
-
-        let time_item_count = u64::try_from(time_points.len())
+        let time_item_count = u64::try_from(self.pending_times.len())
             .map_err(|_| Error::invalid("time series length exceeds supported range"))?;
-
         let time_encoding = encode_time_section(
-            time_data,
+            self.pending_time_data.clone(),
             time_item_count,
             matches!(self.options.time_compression, TimeCompression::Zlib),
             self.options.compression_level,
         )?;
 
-        let begin_time = *time_points.first().unwrap();
-        let end_time = *time_points.last().unwrap();
-
-        let mut payload = Vec::new();
+        let begin_time = self.pending_times[0];
+        let end_time = *self
+            .pending_times
+            .last()
+            .expect("pending times is non-empty");
+        let mut payload = Vec::with_capacity(
+            frame_encoding.payload.len()
+                + chain_buffer.len()
+                + index_bytes.len()
+                + time_encoding.payload.len()
+                + 96,
+        );
         payload.extend_from_slice(&begin_time.to_be_bytes());
         payload.extend_from_slice(&end_time.to_be_bytes());
         payload.extend_from_slice(&required_memory.to_be_bytes());
@@ -945,9 +1129,8 @@ impl<W: WriteSeek> FstWriter<W> {
         encode_varint(frame_encoding.compressed_len, &mut payload);
         encode_varint(frame_max_handle, &mut payload);
         payload.extend_from_slice(&frame_encoding.payload);
-        encode_varint(max_handle as u64, &mut payload); // vc_max_handle
+        encode_varint(max_handle as u64, &mut payload);
         payload.push(pack_type.marker());
-
         payload.extend_from_slice(&chain_buffer);
         payload.extend_from_slice(&index_bytes);
         payload.extend_from_slice(&index_length.to_be_bytes());
@@ -956,7 +1139,12 @@ impl<W: WriteSeek> FstWriter<W> {
         payload.extend_from_slice(&time_encoding.compressed_len.to_be_bytes());
         payload.extend_from_slice(&time_encoding.item_count.to_be_bytes());
 
-        Ok(payload)
+        let block_type = if has_dynamic_aliases {
+            BlockType::VcDataDynAlias2
+        } else {
+            BlockType::VcData
+        };
+        Ok((block_type, payload))
     }
 
     fn write_header_block(&mut self, header: &Header) -> Result<()> {
@@ -965,8 +1153,7 @@ impl<W: WriteSeek> FstWriter<W> {
             .write_all(&header.section_length.to_be_bytes())?;
         self.output.write_all(&header.start_time.to_be_bytes())?;
         self.output.write_all(&header.end_time.to_be_bytes())?;
-        self.output
-            .write_all(&std::f64::consts::E.to_bits().to_be_bytes())?;
+        self.output.write_all(&std::f64::consts::E.to_ne_bytes())?;
         self.output.write_all(&header.memory_used.to_be_bytes())?;
         self.output.write_all(&header.scope_count.to_be_bytes())?;
         self.output.write_all(&header.var_count.to_be_bytes())?;
@@ -982,8 +1169,9 @@ impl<W: WriteSeek> FstWriter<W> {
         self.output.write_all(&version)?;
         self.output.write_all(&date)?;
 
-        self.output.write_all(&[header.file_type])?;
-        self.output.write_all(&header.time_zero.to_be_bytes())?;
+        self.output.write_all(&[header.file_type.into()])?;
+        self.output
+            .write_all(&(header.time_zero as u64).to_be_bytes())?;
         self.output.flush()?;
         Ok(())
     }
@@ -1004,9 +1192,17 @@ impl<W: WriteSeek> FstWriter<W> {
             items: self.hierarchy_items.clone(),
             scopes: self.scopes.clone(),
             variables: self.variables.clone(),
-            attributes: Vec::new(),
+            attributes: self.attributes.clone(),
         };
-        let encoded = block.encode_block(HierarchyCompression::Raw)?;
+        #[cfg(feature = "gzip")]
+        let compression = HierarchyCompression::Zlib {
+            level: self.options.compression_level.unwrap_or(4).min(9),
+        };
+        #[cfg(all(not(feature = "gzip"), feature = "lz4"))]
+        let compression = HierarchyCompression::Lz4;
+        #[cfg(not(any(feature = "lz4", feature = "gzip")))]
+        let compression = HierarchyCompression::Raw;
+        let encoded = block.encode_block(compression)?;
         self.output.write_all(&[encoded.block_type as u8])?;
         self.output.with_writer(|writer| encoded.write_to(writer))?;
         Ok(())
@@ -1014,7 +1210,9 @@ impl<W: WriteSeek> FstWriter<W> {
 
     fn chain_pack_type(&self) -> PackType {
         match self.options.chain_compression {
-            ChainCompression::Raw => PackType::None,
+            // libfst has no raw marker. A 'Z' marker with stored_len=0 chains is the canonical
+            // representation for uncompressed chains and needs no zlib decoder.
+            ChainCompression::Raw => PackType::Zlib,
             ChainCompression::Zlib => PackType::Zlib,
             ChainCompression::Lz4 => PackType::Lz4,
             ChainCompression::FastLz => PackType::FastLz,
@@ -1029,9 +1227,46 @@ fn write_cstring(buf: &mut [u8], value: &str) {
     buf[len] = 0;
 }
 
+fn validate_hierarchy_text(field: &str, value: &str) -> Result<()> {
+    if value.as_bytes().contains(&0) {
+        return Err(Error::invalid(format!(
+            "{field} contains an embedded NUL byte"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_geometry(var_type: VarType, geometry: &GeomEntry) -> Result<()> {
+    if matches!(geometry, GeomEntry::Fixed(0)) {
+        return Err(Error::invalid(
+            "fixed-width geometry must be greater than zero",
+        ));
+    }
+
+    let real_type = matches!(
+        var_type,
+        VarType::VcdReal | VarType::VcdRealParameter | VarType::VcdRealtime | VarType::SvShortReal
+    );
+    if real_type != matches!(geometry, GeomEntry::Real) {
+        return Err(Error::invalid(format!(
+            "variable type {var_type:?} and geometry {geometry:?} disagree about real encoding"
+        )));
+    }
+    if (var_type == VarType::GenString) != matches!(geometry, GeomEntry::Variable) {
+        return Err(Error::invalid(format!(
+            "variable type {var_type:?} and geometry {geometry:?} disagree about variable-length encoding"
+        )));
+    }
+    Ok(())
+}
+
 /// Identifier returned when opening a scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub usize);
+
+/// Identifier returned when adding a hierarchy attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttributeId(pub usize);
 
 const SPECIAL_BIT_CHARS: [u8; 8] = *b"xzhuwl-?";
 
@@ -1082,11 +1317,11 @@ impl BitValue {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PendingChange {
-    timestamp: u64,
-    handle: u32,
-    value: OwnedValue,
+#[derive(Debug, Default)]
+struct PendingChain {
+    data: Vec<u8>,
+    last_time_index: Option<usize>,
+    latest_value: Option<OwnedValue>,
 }
 
 #[derive(Debug, Default)]
@@ -1204,20 +1439,6 @@ impl FrameState {
         }
         Ok(buf)
     }
-
-    fn clone_from(&mut self, source: u32, target: u32) -> Result<()> {
-        if source == 0 || target == 0 {
-            return Err(Error::invalid("frame handles must be non-zero"));
-        }
-        let src_idx = (source - 1) as usize;
-        let dst_idx = (target - 1) as usize;
-        if self.entries.len() <= dst_idx {
-            self.entries.resize(dst_idx + 1, None);
-        }
-        let value = self.entries.get(src_idx).cloned().unwrap_or(None);
-        self.entries[dst_idx] = value;
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1261,6 +1482,70 @@ enum OwnedValue {
     },
     Real(f64),
     VarLen(Vec<u8>),
+}
+
+impl OwnedValue {
+    fn memory_size(&self) -> usize {
+        match self {
+            Self::Bit(_) | Self::Real(_) => std::mem::size_of::<Self>(),
+            Self::Vector { data, packed, .. } => std::mem::size_of::<Self>()
+                .saturating_add(data.len())
+                .saturating_add(packed.as_ref().map_or(0, Vec::len)),
+            Self::VarLen(data) => std::mem::size_of::<Self>().saturating_add(data.len()),
+        }
+    }
+}
+
+fn encode_owned_value(value: &OwnedValue, delta: usize, output: &mut Vec<u8>) -> Result<()> {
+    match value {
+        OwnedValue::Bit(bit) => {
+            encode_varint(bit.encode_marker(delta)?, output);
+        }
+        OwnedValue::Vector {
+            width,
+            packed,
+            data,
+        } => {
+            let delta =
+                u64::try_from(delta).map_err(|_| Error::invalid("time delta exceeds u64 range"))?;
+            if let Some(bits) = packed {
+                if bits.len() != packed_len(*width) {
+                    return Err(Error::invalid("packed vector payload length mismatch"));
+                }
+                encode_varint(delta << 1, output);
+                output.extend_from_slice(bits);
+            } else {
+                if data.len() != *width as usize {
+                    return Err(Error::invalid(
+                        "vector payload length mismatch with geometry",
+                    ));
+                }
+                encode_varint((delta << 1) | 1, output);
+                output.extend_from_slice(data);
+            }
+        }
+        OwnedValue::Real(value) => {
+            let delta =
+                u64::try_from(delta).map_err(|_| Error::invalid("time delta exceeds u64 range"))?;
+            encode_varint((delta << 1) | 1, output);
+            let bytes = if cfg!(target_endian = "little") {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
+            };
+            output.extend_from_slice(&bytes);
+        }
+        OwnedValue::VarLen(bytes) => {
+            let delta =
+                u64::try_from(delta).map_err(|_| Error::invalid("time delta exceeds u64 range"))?;
+            encode_varint(delta << 1, output);
+            let len = u64::try_from(bytes.len())
+                .map_err(|_| Error::invalid("variable-length payload exceeds u64 range"))?;
+            encode_varint(len, output);
+            output.extend_from_slice(bytes);
+        }
+    }
+    Ok(())
 }
 
 fn pack_ascii_bits(data: &[u8], width: u32) -> Option<Vec<u8>> {

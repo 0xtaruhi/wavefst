@@ -40,7 +40,9 @@ pub fn read_cstring<R: Read>(reader: &mut R, len: usize) -> Result<String> {
 /// Advances the reader by `len` bytes.
 #[inline]
 pub fn skip_bytes<R: Read + Seek>(reader: &mut R, len: u64) -> Result<()> {
-    reader.seek(SeekFrom::Current(len as i64))?;
+    let offset = i64::try_from(len)
+        .map_err(|_| Error::invalid("seek distance exceeds signed 64-bit range"))?;
+    reader.seek(SeekFrom::Current(offset))?;
     Ok(())
 }
 
@@ -58,6 +60,9 @@ pub fn read_varint_from_reader<R: Read>(reader: &mut R) -> Result<(u64, usize)> 
         reader.read_exact(&mut buf)?;
         consumed += 1;
         let byte = buf[0];
+        if shift == 63 && byte > 1 {
+            return Err(Error::decode("varint overflows 64-bit capacity"));
+        }
         value |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
             break;

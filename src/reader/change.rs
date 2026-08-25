@@ -46,6 +46,7 @@ struct ChainCursor<'a> {
     data: &'a [u8],
     offset: usize,
     current_time_index: usize,
+    next_marker: Option<(u64, usize, usize)>,
 }
 
 impl<'a> ChainCursor<'a> {
@@ -56,29 +57,41 @@ impl<'a> ChainCursor<'a> {
             data,
             offset: 0,
             current_time_index: 0,
+            next_marker: None,
         }
     }
 
-    fn peek_delta(&self) -> Result<Option<usize>> {
+    #[inline]
+    fn peek_delta(&mut self) -> Result<Option<usize>> {
+        if let Some((_, _, delta)) = self.next_marker {
+            return Ok(Some(delta));
+        }
         if self.offset >= self.data.len() {
             return Ok(None);
         }
         let slice = &self.data[self.offset..];
-        let (marker, _) = decode_varint_with_len(slice)?;
-        let delta = self.compute_delta(marker)?;
+        let (marker, consumed) = decode_varint_with_len(slice)?;
+        let delta = self.compute_delta(marker);
+        self.next_marker = Some((marker, consumed, delta));
         Ok(Some(delta))
     }
 
+    #[inline]
     fn read_value(&mut self, expected_time_index: usize) -> Result<Option<SignalValue<'a>>> {
         if self.offset >= self.data.len() {
             return Ok(None);
         }
 
-        let slice = &self.data[self.offset..];
-        let (marker, consumed) = decode_varint_with_len(slice)?;
+        let (marker, consumed, delta) = match self.next_marker.take() {
+            Some(cached) => cached,
+            None => {
+                let slice = &self.data[self.offset..];
+                let (marker, consumed) = decode_varint_with_len(slice)?;
+                (marker, consumed, self.compute_delta(marker))
+            }
+        };
         self.offset += consumed;
 
-        let delta = self.compute_delta(marker)?;
         self.current_time_index = self
             .current_time_index
             .checked_add(delta)
@@ -195,8 +208,9 @@ impl<'a> ChainCursor<'a> {
         }
     }
 
-    fn compute_delta(&self, marker: u64) -> Result<usize> {
-        let delta = match self.kind {
+    #[inline]
+    fn compute_delta(&self, marker: u64) -> usize {
+        match self.kind {
             SignalKind::Bit => {
                 let flag = (marker & 1) as usize;
                 let shift = 2usize << flag;
@@ -205,8 +219,7 @@ impl<'a> ChainCursor<'a> {
             SignalKind::Vector { .. } | SignalKind::VarLen | SignalKind::Real => {
                 (marker >> 1) as usize
             }
-        };
-        Ok(delta)
+        }
     }
 }
 
@@ -221,12 +234,11 @@ pub struct ValueChange<'a> {
 pub struct VcBlockChanges<'a> {
     block: &'a VcBlockMeta,
     cursors: Vec<ChainCursor<'a>>,
-    schedule: Vec<Vec<usize>>,
-    current_handles: Vec<usize>,
+    schedule_heads: Vec<Option<usize>>,
+    schedule_next: Vec<Option<usize>>,
     pending_aliases: VecDeque<ValueChange<'a>>,
     alias_map: Vec<Vec<u32>>,
     time_index: usize,
-    time_zero: u64,
 }
 
 impl<'a> VcBlockChanges<'a> {
@@ -234,7 +246,6 @@ impl<'a> VcBlockChanges<'a> {
         block: &'a VcBlockMeta,
         geom: &'a GeomInfo,
         alias_index: &'a ChainIndex,
-        time_zero: u64,
     ) -> Result<Self> {
         let mut cursors = Vec::new();
         let mut handle_to_cursor = vec![None; block.chains.len()];
@@ -260,19 +271,17 @@ impl<'a> VcBlockChanges<'a> {
         }
 
         let time_len = block.time_table.timestamps.len();
-        let mut schedule = vec![Vec::new(); time_len];
+        let mut schedule_heads = vec![None; time_len];
+        let mut schedule_next = vec![None; cursors.len()];
 
-        for (idx, cursor) in cursors.iter().enumerate() {
+        for (idx, cursor) in cursors.iter_mut().enumerate() {
             if let Some(delta) = cursor.peek_delta()? {
                 if delta >= time_len {
                     return Err(Error::decode("initial chain delta exceeds time table"));
                 }
-                schedule[delta].push(idx);
+                schedule_next[idx] = schedule_heads[delta].take();
+                schedule_heads[delta] = Some(idx);
             }
-        }
-
-        for handles in &mut schedule {
-            handles.sort_unstable_by_key(|idx| cursors[*idx].handle);
         }
 
         let mut alias_map = vec![Vec::new(); alias_index.slots.len() + 1];
@@ -288,39 +297,92 @@ impl<'a> VcBlockChanges<'a> {
         Ok(Self {
             block,
             cursors,
-            schedule,
-            current_handles: Vec::new(),
+            schedule_heads,
+            schedule_next,
             pending_aliases: VecDeque::new(),
             alias_map,
             time_index: 0,
-            time_zero,
         })
     }
 
+    /// Visits every change without the extra `Option<Result<_>>` layer of [`Iterator::next`].
+    /// This callback-oriented path is intended for high-throughput waveform processing.
+    #[inline]
+    pub fn try_for_each<F>(mut self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(ValueChange<'a>),
+    {
+        while self.time_index < self.schedule_heads.len() {
+            let Some(cursor_idx) = self.schedule_heads[self.time_index].take() else {
+                self.time_index += 1;
+                continue;
+            };
+            self.schedule_heads[self.time_index] = self.schedule_next[cursor_idx].take();
+            let timestamp = self.block.time_table.timestamps[self.time_index];
+            let cursor = &mut self.cursors[cursor_idx];
+            let Some(value) = cursor.read_value(self.time_index)? else {
+                continue;
+            };
+            if let Some(next_delta) = cursor.peek_delta()? {
+                let next_time = self
+                    .time_index
+                    .checked_add(next_delta)
+                    .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                if next_time >= self.schedule_heads.len() {
+                    return Err(Error::decode("chain delta exceeds time table"));
+                }
+                self.schedule_next[cursor_idx] = self.schedule_heads[next_time].take();
+                self.schedule_heads[next_time] = Some(cursor_idx);
+            }
+
+            let handle = cursor.handle;
+            let aliases = &self.alias_map[handle as usize];
+            if aliases.is_empty() {
+                visitor(ValueChange {
+                    timestamp,
+                    handle,
+                    alias_of: None,
+                    value,
+                });
+                continue;
+            }
+
+            visitor(ValueChange {
+                timestamp,
+                handle,
+                alias_of: None,
+                value: value.clone(),
+            });
+            for &alias in aliases {
+                visitor(ValueChange {
+                    timestamp,
+                    handle: alias,
+                    alias_of: Some(handle),
+                    value: value.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn next_canonical(&mut self) -> Result<Option<ValueChange<'a>>> {
         loop {
             if let Some(value) = self.pending_aliases.pop_front() {
                 return Ok(Some(value));
             }
 
-            if self.time_index >= self.block.time_table.timestamps.len() {
+            if self.time_index >= self.schedule_heads.len() {
                 return Ok(None);
             }
 
-            if self.current_handles.is_empty() {
-                let mut handles = std::mem::take(&mut self.schedule[self.time_index]);
-                handles.sort_unstable_by_key(|idx| self.cursors[*idx].handle);
-                self.current_handles = handles;
-            }
-
-            let Some(cursor_idx) = self.current_handles.pop() else {
+            let Some(cursor_idx) = self.schedule_heads[self.time_index].take() else {
                 self.time_index += 1;
                 continue;
             };
+            self.schedule_heads[self.time_index] = self.schedule_next[cursor_idx].take();
 
-            let timestamp = self.block.time_table.timestamps[self.time_index]
-                .checked_add(self.time_zero)
-                .ok_or_else(|| Error::decode("timestamp overflow"))?;
+            let timestamp = self.block.time_table.timestamps[self.time_index];
 
             let cursor = &mut self.cursors[cursor_idx];
             let Some(value) = cursor.read_value(self.time_index)? else {
@@ -332,10 +394,11 @@ impl<'a> VcBlockChanges<'a> {
                     .time_index
                     .checked_add(next_delta)
                     .ok_or_else(|| Error::decode("chain delta overflow"))?;
-                if next_time >= self.schedule.len() {
+                if next_time >= self.schedule_heads.len() {
                     return Err(Error::decode("chain delta exceeds time table"));
                 }
-                self.schedule[next_time].push(cursor_idx);
+                self.schedule_next[cursor_idx] = self.schedule_heads[next_time].take();
+                self.schedule_heads[next_time] = Some(cursor_idx);
             }
 
             let handle = cursor.handle;
@@ -349,7 +412,6 @@ impl<'a> VcBlockChanges<'a> {
                     });
                 }
             }
-
             return Ok(Some(ValueChange {
                 timestamp,
                 handle,
@@ -363,6 +425,7 @@ impl<'a> VcBlockChanges<'a> {
 impl<'a> Iterator for VcBlockChanges<'a> {
     type Item = Result<ValueChange<'a>>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self.next_canonical() {
             Ok(Some(value)) => Some(Ok(value)),
@@ -372,16 +435,12 @@ impl<'a> Iterator for VcBlockChanges<'a> {
     }
 }
 
-pub fn build_changes<'a>(
-    block: &'a VcBlockMeta,
-    geom: &'a GeomInfo,
-    time_zero: u64,
-) -> Result<VcBlockChanges<'a>> {
-    VcBlockChanges::new(block, geom, &block.index, time_zero)
+pub fn build_changes<'a>(block: &'a VcBlockMeta, geom: &'a GeomInfo) -> Result<VcBlockChanges<'a>> {
+    VcBlockChanges::new(block, geom, &block.index)
 }
 
 impl VcBlockMeta {
-    pub fn changes<'a>(&'a self, geom: &'a GeomInfo, time_zero: u64) -> Result<VcBlockChanges<'a>> {
-        build_changes(self, geom, time_zero)
+    pub fn changes<'a>(&'a self, geom: &'a GeomInfo) -> Result<VcBlockChanges<'a>> {
+        build_changes(self, geom)
     }
 }

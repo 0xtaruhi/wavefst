@@ -6,25 +6,24 @@
 
 > Modern Rust reader and writer for the Fast Signal Trace (FST) waveform format.
 
-`wavefst` streams FST data without copying, stays compatible with the original C `libfst`
-implementation, and layers ergonomic APIs on top of the low-level block layout. Readers, writers,
-benchmarks, and fuzz targets all live in the same crate so you can inspect existing traces, build
-new ones, or validate interoperability from a single dependency.
+`wavefst` is a safe Rust reader and writer for GTKWave's FST format. Its on-disk layouts follow the
+reference `libfst` implementation, including gzip/LZ4 hierarchy blocks, signed-LEB128 dynamic
+aliases, block checkpoints, static alias handles, and whole-file gzip wrappers.
 
 ---
 
 ## Highlights
 
-- **Full block coverage** – header, geometry, hierarchy, blackout, and every value-change variant
-  (`FST_BL_VCDATA*`) are decoded and encoded symmetrically.
-- **Zero-copy iteration** – value changes stream straight from decoded buffers with alias handling,
-  initial frames, and timestamps resolved for you.
-- **Pluggable compression** – raw, zlib, LZ4, and FastLZ logic is reusable between reader and writer
-  pipelines, each gated behind a feature flag.
+- **libfst-compatible output** – files are accepted by the reference reader and GTKWave, including
+  static aliases and optional `FST_BL_ZWRAPPER` output.
+- **Bounded streaming** – writers automatically split large change sets into checkpointed VC blocks;
+  readers expose configurable decompression and per-block safety limits.
+- **Pluggable compression** – uncompressed chains plus zlib, LZ4, and FastLZ payloads are supported
+  behind feature flags. Raw chains still use the standard `'Z'` block marker.
 - **Async, SIMD, serde** – optional helpers wrap the synchronous APIs for async I/O, fast ASCII→bit
   packing, and serialisable hierarchy/value-change snapshots.
-- **Tooling ready** – Criterion benches, libFuzzer harnesses, and integration tests are included to
-  keep regressions in check.
+- **Tooling ready** – Criterion benchmarks, feature-matrix tests, and conformance fixtures are
+  included to keep regressions in check.
 
 ---
 
@@ -34,9 +33,9 @@ new ones, or validate interoperability from a single dependency.
 cargo add wavefst
 ```
 
-The default feature set enables gzip/zlib (`gzip`), LZ4 (`lz4`), memory mapping (`mmap`), and the
-SSE2 packed-bit fast path (`simd`). Disable them with `--no-default-features` and opt back into the
-ones you need.
+The default feature set enables gzip/zlib (`gzip`), LZ4 (`lz4`), memory mapping (`mmap`), parallel
+chain codecs (`parallel`), and the SSE2 packed-bit fast path (`simd`). Disable them with
+`--no-default-features` and opt back into the ones you need.
 
 ---
 
@@ -84,8 +83,7 @@ fn build_example(path: &str) -> wavefst::Result<()> {
 
     let mut header = Header::default();
     header.version = "wavefst-demo".into();
-    header.vc_section_count = 1;
-    header.end_time = 20;
+    // Time range, handle counts, and VC section count are backpatched by finish().
     writer.write_header(header)?;
 
     writer.emit_change(0, bit, SignalValue::Bit('0'))?;
@@ -102,10 +100,10 @@ fn build_example(path: &str) -> wavefst::Result<()> {
 
 | Feature    | Default | Description                                                                  |
 |------------|:-------:|------------------------------------------------------------------------------|
-| `gzip`     | ✅      | Enable zlib/deflate support (hierarchy and VC blocks, optional z-wrapper).   |
+| `gzip`     | ✅      | Enable gzip hierarchy/wrapper and zlib VC compression.                       |
 | `lz4`      | ✅      | Support LZ4-compressed hierarchy blocks and value-change chains.             |
 | `fastlz`   | ⛔️     | Add FastLZ decompression/compression for value-change chains.                |
-| `parallel` | ⛔️     | Use Rayon to decode chain payloads in parallel while keeping results sorted. |
+| `parallel` | ✅      | Use Rayon for large chain compression/decompression jobs.                    |
 | `serde`    | ⛔️     | Provide serialisable hierarchy and value-change snapshots (`serde_support`). |
 | `mmap`     | ✅      | Expose the memory-mapped reader backend (`io::MemoryMap`).                   |
 | `async`    | ⛔️     | Include buffered async wrappers (`async_support`) built on `tokio`.          |
@@ -121,34 +119,16 @@ cargo add wavefst --no-default-features --features "gzip parallel"
 
 ## Performance
 
-### Criterion benches (release profile, Apple M-series, macOS 25.0.0)
-
-| Benchmark                   | Raw     | Zlib    | LZ4     |
-|-----------------------------|---------|---------|---------|
-| `reader_next_value_changes` | 32.3 µs | 41.7 µs | 34.2 µs |
-| `writer_emit_change`        | 115 µs  | 194 µs  | 125 µs  |
-
-Run with:
+Criterion benchmarks cover full trace creation and full value-change traversal for raw, zlib, LZ4,
+and optional FastLZ configurations. Run them on the target machine with:
 
 ```bash
 cargo bench
 ```
 
-### Comparison with C `libfst`
-
-Using the upstream `fstReaderIterBlocks` helper (compiled with `clang -std=c99 -O2`):
-
-| Scenario          | Rust (µs) | C helper (µs) | Speed-up |
-|-------------------|----------:|--------------:|---------:|
-| baseline, raw     |    50.9   |     335 551   | ×6 590   |
-| baseline, wrapped |    57.0   |       6 436   | ×113     |
-| wide, raw         |   130.3   |       2 933   | ×22.5    |
-| wide, wrapped     |    65.3   |       2 191   | ×33.6    |
-
-Debug builds show similar ratios (×4.6–×5.6). Event counters matched exactly between both
-implementations.
-
----
+The ordinary value-change iterator prioritises ergonomic per-event error handling. For hot analysis
+loops, consume a block with `changes.try_for_each(|event| { ... })`; this removes the iterator's
+`Option<Result<_>>` layer while retaining format validation.
 
 ## Async, SIMD, and serde helpers
 
@@ -165,19 +145,17 @@ implementations.
 
 - **Tests** – `cargo test` (add `--features "async gzip serde simd"` to exercise optional paths).
 - **Benches** – `cargo bench` compares reader/writer throughput across compression modes.
-- **Docs** – `doc/fst_format.md` describes the binary format; `doc/rust_crate_design.md` covers the
-  crate layout and design notes (both ASCII safe).
+- **Interop fixture** – the checked-in `hdl-example.fst` event count is compared with the reference
+  `fstReaderIterBlocks` result.
+- **Example** – `cargo run --example write_fst -- out.fst` creates a GTKWave-ready trace; append
+  `--wrapped` to exercise the whole-file gzip wrapper.
 
 ---
 
-## Roadmap
-
-- Optional CLI (`wavefst-tool`) for inspecting traces and converting to other formats.
-- Additional fixtures that exercise mixed compression, alias chains, and multi-block timelines.
-- Configurable logging hooks (`tracing`) for long-running ingest jobs.
-
-Contributions, bug reports, and ideas are very welcome. File an issue or open a pull request with a
-reproduction trace if you hit a corner case.
+Static hierarchy aliases reuse their target handle, exactly as libfst does. Consequently,
+`add_alias` returns the target handle and value-change iteration emits one canonical event rather
+than inventing a second signal handle. `Header::time_zero` is signed metadata and is not added to
+event timestamps.
 
 ---
 

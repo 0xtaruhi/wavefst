@@ -16,5 +16,6 @@ pub use hier::{
 pub use time::TimeSection;
 pub use vc::{
     ChainIndexEntry, FrameEncoding, FrameSection, PackMarker, TimeEncoding, TimeTable, VcBlock,
-    encode_chain_index, encode_chain_payload, encode_frame_section, encode_time_section,
+    encode_chain_index, encode_chain_index_dyn_alias2, encode_chain_payload, encode_frame_section,
+    encode_time_section,
 };

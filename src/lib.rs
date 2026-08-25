@@ -43,5 +43,6 @@ pub use serde_support::{
 };
 pub use types::*;
 pub use writer::{
-    ChainCompression, FstWriter, ScopeId, TimeCompression, WriterBuilder, WriterOptions,
+    AttributeId, ChainCompression, FstWriter, ScopeId, TimeCompression, WriterBuilder,
+    WriterOptions,
 };

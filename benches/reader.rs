@@ -101,6 +101,7 @@ fn generate_trace(chain: ChainCompression, time: TimeCompression) -> Vec<u8> {
 }
 
 fn bench_placeholder(c: &mut Criterion) {
+    #[allow(unused_mut, clippy::useless_vec)]
     let mut configs = vec![("raw", ChainCompression::Raw, TimeCompression::Raw)];
     #[cfg(feature = "gzip")]
     {
@@ -108,7 +109,12 @@ fn bench_placeholder(c: &mut Criterion) {
     }
     #[cfg(feature = "lz4")]
     {
-        configs.push(("lz4", ChainCompression::Lz4, TimeCompression::Zlib));
+        let time = if cfg!(feature = "gzip") {
+            TimeCompression::Zlib
+        } else {
+            TimeCompression::Raw
+        };
+        configs.push(("lz4", ChainCompression::Lz4, time));
     }
     #[cfg(feature = "fastlz")]
     {
@@ -132,6 +138,24 @@ fn bench_placeholder(c: &mut Criterion) {
                             break;
                         }
                     }
+                }
+            });
+        });
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("reader_try_for_each");
+    for (label, bytes) in &traces {
+        group.bench_with_input(BenchmarkId::from_parameter(label), bytes, |b, data| {
+            b.iter(|| {
+                let cursor = Cursor::new(data.as_slice());
+                let mut reader = ReaderBuilder::new(cursor).build().unwrap();
+                while let Some(changes) = reader.next_value_changes().unwrap() {
+                    changes
+                        .try_for_each(|event| {
+                            std::hint::black_box(event);
+                        })
+                        .unwrap();
                 }
             });
         });

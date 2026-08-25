@@ -50,10 +50,21 @@ pub enum ScopeType {
     VhdlIfGenerate = 19,
     VhdlGenerate = 20,
     VhdlPackage = 21,
+    SvArray = 22,
     GenAttrBegin = 252,
     GenAttrEnd = 253,
     VcdScope = 254,
     VcdUpscope = 255,
+}
+
+/// HDL family recorded in the FST header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[repr(u8)]
+pub enum FileType {
+    Verilog = 0,
+    Vhdl = 1,
+    Mixed = 2,
 }
 
 /// All supported variable kinds.

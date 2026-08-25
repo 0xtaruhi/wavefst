@@ -3,7 +3,11 @@
 use std::io::{Read, Write};
 
 #[cfg(feature = "gzip")]
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
+use flate2::{
+    Compression,
+    read::{GzDecoder, ZlibDecoder},
+    write::GzEncoder,
+};
 #[cfg(feature = "lz4")]
 use lz4_flex::block::{compress as lz4_compress, decompress as lz4_decompress};
 
@@ -118,34 +122,21 @@ impl HierarchyBlock {
     pub fn encode_block(&self, compression: HierarchyCompression) -> Result<EncodedHierarchy> {
         let raw = self.emit_stream()?;
         let uncompressed_len = raw.len() as u64;
+        #[cfg(not(any(feature = "gzip", feature = "lz4")))]
+        let _ = uncompressed_len;
 
         match compression {
-            HierarchyCompression::Raw => {
-                let section_length = raw.len() as u64 + 16;
-                Ok(EncodedHierarchy {
-                    block_type: BlockType::Hierarchy,
-                    section_length,
-                    uncompressed_len,
-                    stage_prefix: Vec::new(),
-                    data: raw,
-                })
-            }
+            HierarchyCompression::Raw => Err(Error::unsupported(
+                "the FST hierarchy block has no raw encoding; use gzip or LZ4",
+            )),
             HierarchyCompression::Zlib { level } => {
                 #[cfg(feature = "gzip")]
                 {
-                    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
+                    // libfst names this block FST_BL_HIER, but its payload is a gzip member rather
+                    // than a bare RFC 1950 zlib stream.
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level.min(9)));
                     encoder.write_all(&raw)?;
                     let compressed = encoder.finish()?;
-                    if compressed.len() >= raw.len() {
-                        let section_length = raw.len() as u64 + 16;
-                        return Ok(EncodedHierarchy {
-                            block_type: BlockType::Hierarchy,
-                            section_length,
-                            uncompressed_len,
-                            stage_prefix: Vec::new(),
-                            data: raw,
-                        });
-                    }
                     let section_length = compressed.len() as u64 + 16;
                     Ok(EncodedHierarchy {
                         block_type: BlockType::Hierarchy,
@@ -404,15 +395,27 @@ impl EncodedHierarchy {
 }
 
 fn decode_zlib_maybe(payload: &[u8], expected: usize) -> Result<Vec<u8>> {
+    // Accept legacy raw blocks produced by wavefst 0.1, even though libfst never emitted them.
     if payload.len() == expected {
         return Ok(payload.to_vec());
     }
 
     #[cfg(feature = "gzip")]
     {
-        let mut decoder = ZlibDecoder::new(payload);
-        let mut decoded = Vec::with_capacity(expected);
-        decoder.read_to_end(&mut decoded)?;
+        let mut decoded = Vec::with_capacity(expected.min(16 * 1024 * 1024));
+        let limit = u64::try_from(expected)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if payload.starts_with(&[0x1f, 0x8b]) {
+            GzDecoder::new(payload)
+                .take(limit)
+                .read_to_end(&mut decoded)?;
+        } else {
+            // Compatibility with early wavefst versions that incorrectly used zlib here.
+            ZlibDecoder::new(payload)
+                .take(limit)
+                .read_to_end(&mut decoded)?;
+        }
         if decoded.len() != expected {
             return Err(Error::decode(
                 "hierarchy zlib decoding length mismatch with header",

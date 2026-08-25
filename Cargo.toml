@@ -9,7 +9,7 @@ repository = "https://github.com/0xtaruhi/wavefst"
 readme = "README.md"
 
 [features]
-default = ["gzip", "lz4", "mmap", "simd"]
+default = ["gzip", "lz4", "mmap", "parallel", "simd"]
 
 gzip = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
@@ -21,13 +21,8 @@ async = ["dep:tokio"]
 simd = []
 
 [dependencies]
-cfg-if = "1.0"
 thiserror = "1.0"
-tracing = { version = "0.1", default-features = false, features = ["std"] }
-smallvec = { version = "1.11", features = ["union"] }
-bytes = "1.6"
 num_enum = "0.7"
-clap = { version = "4.5", features = ["derive"] }
 
 flate2 = { version = "1", optional = true, default-features = false, features = ["zlib-rs"] }
 lz4_flex = { version = "0.11", optional = true }

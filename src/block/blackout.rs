@@ -19,21 +19,27 @@ pub struct BlackoutBlock {
 
 impl BlackoutBlock {
     /// Serializes the block to a buffer.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         encode_varint(self.events.len() as u64, out);
         let mut prev = 0u64;
         for event in &self.events {
             out.push(if event.is_on { 1 } else { 0 });
-            let delta = event.time.saturating_sub(prev);
+            let delta = event
+                .time
+                .checked_sub(prev)
+                .ok_or_else(|| Error::invalid("blackout events must be chronological"))?;
             encode_varint(delta, out);
             prev = event.time;
         }
+        Ok(())
     }
 
     /// Decodes the block from raw bytes.
     pub fn decode(mut data: &[u8]) -> Result<Self> {
         let count = decode_varint(&mut data)?;
-        let mut events = Vec::with_capacity(count as usize);
+        let count = usize::try_from(count)
+            .map_err(|_| Error::decode("blackout event count exceeds addressable memory"))?;
+        let mut events = Vec::with_capacity(count.min(data.len() / 2));
         let mut time = 0u64;
         for _ in 0..count {
             let (flag, rest) = data

@@ -82,7 +82,17 @@ pub fn parse_vc_block<R: Read + Seek>(
     block_type: BlockType,
     section_start: u64,
     payload_len: u64,
+    max_block_bytes: u64,
+    max_handles: u64,
 ) -> Result<VcBlockMeta> {
+    if payload_len < 61 {
+        return Err(Error::invalid(
+            "value-change payload shorter than required fields",
+        ));
+    }
+    let block_end = section_start
+        .checked_add(payload_len)
+        .ok_or_else(|| Error::invalid("value-change block exceeds file bounds"))?;
     let begin_time = read_u64_be(reader)?;
     let end_time = read_u64_be(reader)?;
     let required_memory = read_u64_be(reader)?;
@@ -90,7 +100,25 @@ pub fn parse_vc_block<R: Read + Seek>(
     let (frame_compressed_len, _) = read_varint_from_reader(reader)?;
     let (frame_max_handle, _) = read_varint_from_reader(reader)?;
 
-    let mut frame_bytes = vec![0u8; frame_compressed_len as usize];
+    if required_memory > max_block_bytes || frame_uncompressed_len > max_block_bytes {
+        return Err(Error::invalid(
+            "decoded value-change data exceeds configured block limit",
+        ));
+    }
+
+    let frame_compressed_len_usize = usize::try_from(frame_compressed_len)
+        .map_err(|_| Error::invalid("frame payload exceeds addressable memory"))?;
+    let frame_start = reader.stream_position()?;
+    let latest_frame_end = block_end
+        .checked_sub(34)
+        .ok_or_else(|| Error::invalid("value-change block trailer underflow"))?;
+    let frame_end = frame_start
+        .checked_add(frame_compressed_len)
+        .ok_or_else(|| Error::invalid("frame payload offset overflow"))?;
+    if frame_end > latest_frame_end {
+        return Err(Error::invalid("frame payload exceeds value-change block"));
+    }
+    let mut frame_bytes = vec![0u8; frame_compressed_len_usize];
     if frame_compressed_len > 0 {
         reader.read_exact(&mut frame_bytes)?;
     }
@@ -102,6 +130,13 @@ pub fn parse_vc_block<R: Read + Seek>(
     )?;
 
     let (vc_max_handle, _) = read_varint_from_reader(reader)?;
+    if vc_max_handle > max_handles {
+        return Err(Error::invalid(format!(
+            "value-change block declares {vc_max_handle} handles, above configured limit {max_handles}"
+        )));
+    }
+    let vc_max_handle_usize = usize::try_from(vc_max_handle)
+        .map_err(|_| Error::invalid("value-change handle count exceeds addressable memory"))?;
 
     let mut pack = [0u8; 1];
     reader.read_exact(&mut pack)?;
@@ -109,15 +144,6 @@ pub fn parse_vc_block<R: Read + Seek>(
         .ok_or_else(|| Error::decode(format!("unknown pack marker {:02x}", pack[0])))?;
 
     let chain_start = reader.stream_position()?;
-    let block_end = section_start
-        .checked_add(payload_len)
-        .ok_or_else(|| Error::invalid("value-change block exceeds file bounds"))?;
-
-    if payload_len < 32 {
-        return Err(Error::invalid(
-            "value-change payload shorter than required trailer",
-        ));
-    }
 
     let time_trailer_start = block_end
         .checked_sub(24)
@@ -126,6 +152,9 @@ pub fn parse_vc_block<R: Read + Seek>(
     let time_uncompressed_len = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
     let time_compressed_len = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
     let time_item_count = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
+    if time_uncompressed_len > max_block_bytes || time_compressed_len > max_block_bytes {
+        return Err(Error::invalid("time table exceeds configured block limit"));
+    }
 
     let time_section = TimeSection {
         uncompressed_len: time_uncompressed_len,
@@ -143,12 +172,18 @@ pub fn parse_vc_block<R: Read + Seek>(
         .ok_or_else(|| Error::invalid("missing index length trailer"))?;
     reader.seek(SeekFrom::Start(index_length_pos))?;
     let index_length = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
+    if index_length > max_block_bytes {
+        return Err(Error::invalid("chain index exceeds configured block limit"));
+    }
 
     let index_start = index_length_pos
         .checked_sub(index_length)
         .ok_or_else(|| Error::invalid("index length exceeds block bounds"))?;
 
     let chain_end = index_start;
+    if chain_end < chain_start {
+        return Err(Error::invalid("chain index overlaps value-change header"));
+    }
 
     let header = VcBlock {
         begin_time,
@@ -167,7 +202,7 @@ pub fn parse_vc_block<R: Read + Seek>(
         block_type,
         index_start,
         index_length,
-        vc_max_handle as usize,
+        vc_max_handle_usize,
         chain_start,
         chain_end,
     )?;
@@ -240,7 +275,12 @@ fn build_chains(
             continue;
         };
 
-        let rel_offset = (slot.offset - chain_start) as usize;
+        let rel_offset = slot
+            .offset
+            .checked_sub(chain_start)
+            .ok_or_else(|| Error::decode("chain slot precedes chain buffer"))?;
+        let rel_offset = usize::try_from(rel_offset)
+            .map_err(|_| Error::decode("chain offset exceeds addressable memory"))?;
         let length = slot.length as usize;
         let end = rel_offset
             .checked_add(length)
@@ -259,7 +299,7 @@ fn build_chains(
             let range_start = rel_offset + consumed;
             let range_end = rel_offset + length;
             chains[handle_index] = Some(ChainData {
-                handle: handle_index as u32,
+                handle: (handle_index + 1) as u32,
                 stored_len: (length - consumed) as u32,
                 payload: ChainPayload::Borrowed {
                     range: range_start..range_end,
@@ -292,7 +332,8 @@ fn build_chains(
 
     #[cfg(feature = "parallel")]
     let results: Vec<ChainJobResult> = {
-        if jobs.len() <= 1 {
+        let decoded_bytes: u64 = jobs.iter().map(|job| job.stored_len).sum();
+        if jobs.len() < 32 || decoded_bytes < 64 * 1024 {
             jobs.into_iter().map(decompress).collect::<Result<_>>()?
         } else {
             jobs.into_par_iter()
@@ -331,9 +372,12 @@ fn decompress_chain_payload(
         PackType::Zlib => {
             #[cfg(feature = "gzip")]
             {
-                let mut decoder = ZlibDecoder::new(input);
-                let mut out = Vec::with_capacity(expected_len);
-                decoder.read_to_end(&mut out)?;
+                let decoder = ZlibDecoder::new(input);
+                let mut out = Vec::with_capacity(expected_len.min(16 * 1024 * 1024));
+                let limit = u64::try_from(expected_len)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                decoder.take(limit).read_to_end(&mut out)?;
                 if out.len() != expected_len {
                     return Err(Error::decode("chain zlib length mismatch"));
                 }
@@ -439,6 +483,9 @@ fn decode_chain_index<R: Read + Seek>(
             slice = tmp;
 
             if shval > 0 {
+                if entries.len() >= max_handle_hint {
+                    return Err(Error::decode("chain index contains too many handles"));
+                }
                 last_offset = last_offset
                     .checked_add(shval as u64)
                     .ok_or_else(|| Error::decode("chain index overflow"))?;
@@ -448,6 +495,9 @@ fn decode_chain_index<R: Read + Seek>(
                 has_payload.push(true);
                 last_alias_target = None;
             } else if shval < 0 {
+                if entries.len() >= max_handle_hint {
+                    return Err(Error::decode("chain index contains too many handles"));
+                }
                 let target = ((-shval) as u64)
                     .checked_sub(1)
                     .ok_or_else(|| Error::decode("invalid alias target"))?
@@ -456,9 +506,15 @@ fn decode_chain_index<R: Read + Seek>(
                 has_payload.push(false);
                 last_alias_target = Some(target);
             } else if let Some(target) = last_alias_target {
+                if entries.len() >= max_handle_hint {
+                    return Err(Error::decode("chain index contains too many handles"));
+                }
                 entries.push(EntryTmp::Alias { target });
                 has_payload.push(false);
             } else {
+                if entries.len() >= max_handle_hint {
+                    return Err(Error::decode("chain index contains too many handles"));
+                }
                 entries.push(EntryTmp::Empty);
                 has_payload.push(false);
             }
@@ -472,10 +528,16 @@ fn decode_chain_index<R: Read + Seek>(
             let (alias, alias_consumed) = decode_varint_with_len(slice)?;
             slice = &slice[alias_consumed..];
             if alias == 0 {
+                if entries.len() >= max_handle_hint {
+                    return Err(Error::decode("chain index contains too many handles"));
+                }
                 entries.push(EntryTmp::Empty);
                 has_payload.push(false);
                 last_alias_target = None;
             } else {
+                if entries.len() >= max_handle_hint {
+                    return Err(Error::decode("chain index contains too many handles"));
+                }
                 let target = alias
                     .checked_sub(1)
                     .ok_or_else(|| Error::decode("invalid alias handle"))?
@@ -489,13 +551,18 @@ fn decode_chain_index<R: Read + Seek>(
 
         if (value & 1) == 0 {
             let repeat = (value >> 1) as usize;
-            for _ in 0..repeat {
-                entries.push(EntryTmp::Empty);
-                has_payload.push(false);
+            let remaining = max_handle_hint.saturating_sub(entries.len());
+            if repeat == 0 || repeat > remaining {
+                return Err(Error::decode("invalid empty run in chain index"));
             }
+            entries.extend((0..repeat).map(|_| EntryTmp::Empty));
+            has_payload.resize(has_payload.len() + repeat, false);
             continue;
         }
 
+        if entries.len() >= max_handle_hint {
+            return Err(Error::decode("chain index contains too many handles"));
+        }
         let delta = value >> 1;
         last_offset = last_offset
             .checked_add(delta)
@@ -505,6 +572,13 @@ fn decode_chain_index<R: Read + Seek>(
         });
         has_payload.push(true);
         last_alias_target = None;
+    }
+
+    if entries.len() != max_handle_hint {
+        return Err(Error::decode(format!(
+            "chain index describes {} handles, expected {max_handle_hint}",
+            entries.len()
+        )));
     }
 
     let total_chain_len = chain_end
