@@ -143,6 +143,10 @@ parallel thread-local `try_fold_parts_parallel`; ordered scalar reductions can u
 or the two-state `try_fold_binary` specialization. All retain bounds and format validation. Dense
 single-bit writers should prefer `emit_binary_batch`.
 
+Large independent chain codecs use a lazily initialized pool capped at 32 workers, preventing
+many-core hosts from spending more time on Rayon work stealing than on short FST streams. Explicit
+parallel traversal APIs continue to use the application's global Rayon pool.
+
 ## Async, SIMD, and serde helpers
 
 - `wavefst::async_support::{AsyncReader, AsyncWriter}` buffer async sources/sinks using `tokio`

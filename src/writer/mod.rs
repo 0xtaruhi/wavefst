@@ -13,6 +13,8 @@ use crate::types::{
     HierarchyAttributeType, MiscAttributeType, PackType, ScopeType, SignalValue,
     SupplementalDataType, SupplementalVarType, VarDir, VarType,
 };
+#[cfg(feature = "parallel")]
+use crate::util::{codec_partition_len, in_codec_pool};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Seek, SeekFrom, Write};
@@ -966,6 +968,17 @@ impl<W: WriteSeek> FstWriter<W> {
         for &(handle, _) in changes {
             self.validate_binary_handle(handle)?;
         }
+
+        let estimated_bytes = changes
+            .len()
+            .saturating_mul(std::mem::size_of::<OwnedValue>());
+        let fits_current_block = self.pending_change_count.saturating_add(changes.len())
+            <= self.options.block_change_limit
+            && self.pending_bytes.saturating_add(estimated_bytes) <= self.options.block_size_limit;
+        if !changes.is_empty() && fits_current_block {
+            return self.queue_binary_batch(timestamp, changes);
+        }
+
         for &(handle, value) in changes {
             let geom_index = (handle - 1) as usize;
             self.queue_binary_change(timestamp, geom_index, value)?;
@@ -1076,19 +1089,7 @@ impl<W: WriteSeek> FstWriter<W> {
             self.flush_value_changes()?;
         }
 
-        let time_index = if self.pending_times.last().copied() == Some(timestamp) {
-            self.pending_times.len() - 1
-        } else {
-            let delta = match self.pending_times.last().copied() {
-                Some(previous) => timestamp
-                    .checked_sub(previous)
-                    .ok_or_else(|| Error::invalid("timestamps must be non-decreasing"))?,
-                None => timestamp,
-            };
-            encode_varint(delta, &mut self.pending_time_data);
-            self.pending_times.push(timestamp);
-            self.pending_times.len() - 1
-        };
+        let time_index = self.queue_time(timestamp)?;
 
         let chain = &mut self.pending_chains[geom_index];
         let delta = match chain.last_time_index {
@@ -1115,6 +1116,63 @@ impl<W: WriteSeek> FstWriter<W> {
             self.flush_value_changes()?;
         }
         Ok(())
+    }
+
+    #[inline]
+    fn queue_binary_batch(&mut self, timestamp: u64, changes: &[(u32, bool)]) -> Result<()> {
+        let time_index = self.queue_time(timestamp)?;
+        let mut bytes_added = 0usize;
+        let chain_reserve = self
+            .options
+            .block_change_limit
+            .div_ceil(self.pending_chains.len().max(1))
+            .clamp(1, 256);
+        for &(handle, value) in changes {
+            let chain = &mut self.pending_chains[(handle - 1) as usize];
+            if chain.data.capacity() == 0 {
+                chain.data.reserve(chain_reserve);
+            }
+            let delta = match chain.last_time_index {
+                Some(previous) => time_index
+                    .checked_sub(previous)
+                    .ok_or_else(|| Error::invalid("time indices must be non-decreasing"))?,
+                None => time_index,
+            };
+            let bit = if value { BitValue::One } else { BitValue::Zero };
+            let old_len = chain.data.len();
+            encode_varint(bit.encode_marker(delta)?, &mut chain.data);
+            bytes_added = bytes_added.saturating_add(chain.data.len() - old_len);
+            chain.last_time_index = Some(time_index);
+            chain.latest_value = Some(OwnedValue::Bit(bit));
+        }
+
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes_added);
+        self.pending_change_count = self.pending_change_count.saturating_add(changes.len());
+        self.first_change_time.get_or_insert(timestamp);
+        self.last_change_time = Some(timestamp);
+
+        if self.pending_change_count >= self.options.block_change_limit
+            || self.pending_bytes >= self.options.block_size_limit
+        {
+            self.flush_value_changes()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn queue_time(&mut self, timestamp: u64) -> Result<usize> {
+        if self.pending_times.last().copied() == Some(timestamp) {
+            return Ok(self.pending_times.len() - 1);
+        }
+        let delta = match self.pending_times.last().copied() {
+            Some(previous) => timestamp
+                .checked_sub(previous)
+                .ok_or_else(|| Error::invalid("timestamps must be non-decreasing"))?,
+            None => timestamp,
+        };
+        encode_varint(delta, &mut self.pending_time_data);
+        self.pending_times.push(timestamp);
+        Ok(self.pending_times.len() - 1)
     }
 
     fn push_attribute(
@@ -1464,11 +1522,20 @@ impl<W: WriteSeek> FstWriter<W> {
         #[cfg(feature = "parallel")]
         let encoded_payloads: Vec<(u64, Vec<u8>)> = {
             let canonical_bytes: usize = canonical_payloads.iter().map(|data| data.len()).sum();
-            if canonical_payloads.len() >= 32 && canonical_bytes >= 64 * 1024 {
-                canonical_payloads
-                    .par_iter()
-                    .map(encode_payload)
-                    .collect::<Result<_>>()?
+            if matches!(
+                chain_compression,
+                ChainCompression::Zlib | ChainCompression::FastLz
+            ) && canonical_payloads.len() >= 32
+                && canonical_bytes >= 64 * 1024
+            {
+                let partition_len = codec_partition_len(canonical_payloads.len());
+                in_codec_pool(|| {
+                    canonical_payloads
+                        .par_iter()
+                        .with_min_len(partition_len)
+                        .map(encode_payload)
+                        .collect::<Result<_>>()
+                })?
             } else {
                 canonical_payloads
                     .iter()

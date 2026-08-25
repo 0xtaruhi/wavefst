@@ -322,6 +322,45 @@ fn binary_batch_fast_path_matches_regular_changes() -> wavefst::Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "gzip", feature = "parallel"))]
+#[test]
+fn bounded_parallel_codec_pool_round_trips_many_chains() -> wavefst::Result<()> {
+    const SIGNALS: usize = 64;
+    const STEPS: usize = 1_024;
+
+    let mut writer = FstWriter::builder(Cursor::new(Vec::new()))
+        .chain_compression(ChainCompression::Zlib)
+        .time_compression(TimeCompression::Zlib)
+        .build()?;
+    writer.begin_scope(ScopeType::VcdModule, "parallel", None)?;
+    let mut batch = Vec::with_capacity(SIGNALS);
+    for signal in 0..SIGNALS {
+        let handle = writer.add_variable(
+            VarType::VcdWire,
+            VarDir::Implicit,
+            format!("s{signal}"),
+            GeomEntry::Fixed(1),
+        )?;
+        batch.push((handle, false));
+    }
+    writer.end_scope()?;
+    writer.write_header(Header::default())?;
+
+    for step in 0..STEPS {
+        for (signal, (_, value)) in batch.iter_mut().enumerate() {
+            *value = (signal + step) & 1 != 0;
+        }
+        writer.emit_binary_batch(step as u64, &batch)?;
+    }
+    let bytes = writer.finish()?.into_inner();
+
+    let mut reader = ReaderBuilder::new(Cursor::new(bytes)).build()?;
+    let changes = reader.next_value_changes()?.expect("VC block");
+    let count = changes.try_fold_binary(0usize, |count, _, _, _, _| count + 1)?;
+    assert_eq!(count, SIGNALS * STEPS);
+    Ok(())
+}
+
 #[test]
 fn binary_batch_handles_empty_duplicate_and_flush_boundary() -> wavefst::Result<()> {
     let mut writer = FstWriter::builder(Cursor::new(Vec::new()))

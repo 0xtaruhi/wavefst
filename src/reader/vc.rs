@@ -15,6 +15,8 @@ use crate::block::{FrameSection, PackMarker, TimeSection, TimeTable, VcBlock};
 use crate::encoding::{decode_svarint, decode_varint_with_len};
 use crate::error::{Error, Result};
 use crate::types::{BlockType, FstByteOrder, PackType};
+#[cfg(feature = "parallel")]
+use crate::util::{codec_partition_len, in_codec_pool};
 use crate::util::{read_u64_be, read_varint_from_reader};
 
 /// Fully decoded metadata and payload slices extracted from a value-change block.
@@ -376,12 +378,16 @@ fn build_chains(
     #[cfg(feature = "parallel")]
     let results: Vec<ChainJobResult> = {
         let decoded_bytes: u64 = jobs.iter().map(|job| job.stored_len).sum();
-        if jobs.len() < 32 || decoded_bytes < 64 * 1024 {
+        if pack_type == PackType::Lz4 || jobs.len() < 32 || decoded_bytes < 64 * 1024 {
             jobs.into_iter().map(decompress).collect::<Result<_>>()?
         } else {
-            jobs.into_par_iter()
-                .map(decompress)
-                .collect::<Result<Vec<_>>>()?
+            let partition_len = codec_partition_len(jobs.len());
+            in_codec_pool(|| {
+                jobs.into_par_iter()
+                    .with_min_len(partition_len)
+                    .map(decompress)
+                    .collect::<Result<Vec<_>>>()
+            })?
         }
     };
 

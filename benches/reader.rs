@@ -145,6 +145,20 @@ fn generate_dense_trace(chain: ChainCompression, time: TimeCompression) -> Vec<u
     writer.finish().expect("finish").into_inner()
 }
 
+fn fold_dense_binary(data: &[u8]) -> usize {
+    let mut reader = ReaderBuilder::new(Cursor::new(data)).build().unwrap();
+    let mut count = 0usize;
+    while let Some(changes) = reader.next_value_changes().unwrap() {
+        count = changes
+            .try_fold_binary(count, |count, timestamp, handle, alias, value| {
+                std::hint::black_box((timestamp, handle, alias, value));
+                count + 1
+            })
+            .unwrap();
+    }
+    count
+}
+
 fn bench_placeholder(c: &mut Criterion) {
     #[allow(unused_mut, clippy::useless_vec)]
     let mut configs = vec![("raw", ChainCompression::Raw, TimeCompression::Raw)];
@@ -217,21 +231,18 @@ fn bench_placeholder(c: &mut Criterion) {
     let mut group = c.benchmark_group("reader_dense_scan");
     group.bench_function("ordered_binary_fold", |b| {
         b.iter(|| {
-            let mut reader = ReaderBuilder::new(Cursor::new(dense.as_slice()))
-                .build()
-                .unwrap();
-            let mut count = 0usize;
-            while let Some(changes) = reader.next_value_changes().unwrap() {
-                count = changes
-                    .try_fold_binary(count, |count, timestamp, handle, alias, value| {
-                        std::hint::black_box((timestamp, handle, alias, value));
-                        count + 1
-                    })
-                    .unwrap();
-            }
-            std::hint::black_box(count);
+            std::hint::black_box(fold_dense_binary(&dense));
         });
     });
+    #[cfg(feature = "lz4")]
+    {
+        let dense_lz4 = generate_dense_trace(ChainCompression::Lz4, TimeCompression::Raw);
+        group.bench_function("ordered_binary_fold_lz4", |b| {
+            b.iter(|| {
+                std::hint::black_box(fold_dense_binary(&dense_lz4));
+            });
+        });
+    }
     group.bench_function("handle_major", |b| {
         b.iter(|| {
             let mut reader = ReaderBuilder::new(Cursor::new(dense.as_slice()))

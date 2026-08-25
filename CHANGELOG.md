@@ -25,6 +25,8 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - Reworked value-change decoding around reusable arenas and specialized validated hot paths.
+- Bounded parallel chain codecs, fused dense binary batches, and adaptive per-chain reservations to
+  avoid excessive work stealing and allocator growth on many-core hosts.
 - Updated all dependencies to current releases, including `lz4_flex` 0.14, `thiserror` 2, and
   Criterion 0.8.
 - Removed unused compression and streaming wrapper modules and reduced the exposed internal API.
