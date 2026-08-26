@@ -211,8 +211,16 @@ impl GeomInfo {
     /// encoder attempts zlib compression and falls back to the raw stream if compression is
     /// ineffective.
     pub fn encode_block(&self, compress: bool) -> Result<EncodedGeometry> {
-        let mut raw = Vec::with_capacity(self.entries.len() * 2);
-        for entry in &self.entries {
+        Self::encode_entries(self.max_handle, &self.entries, compress)
+    }
+
+    pub(crate) fn encode_entries(
+        max_handle: u64,
+        entries: &[GeomEntry],
+        compress: bool,
+    ) -> Result<EncodedGeometry> {
+        let mut raw = Vec::with_capacity(entries.len() * 2);
+        for entry in entries {
             encode_varint(entry.to_raw(), &mut raw);
         }
 
@@ -244,7 +252,7 @@ impl GeomInfo {
         Ok(EncodedGeometry {
             section_length,
             uncompressed_len,
-            max_handle: self.max_handle,
+            max_handle,
             data,
             compressed: used_compression,
         })

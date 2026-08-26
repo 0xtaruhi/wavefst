@@ -1,5 +1,7 @@
 //! Incremental writer producing FST output streams.
 
+#[cfg(feature = "gzip")]
+use crate::block::ZlibChainEncoder;
 use crate::block::{
     AttributeEntry, BlackoutBlock, BlackoutEvent, ChainIndexEntry, GeomEntry, GeomInfo, Header,
     HierarchyBlock, HierarchyCompression, HierarchyItem, ScopeEntry, VarEntry, encode_chain_index,
@@ -1531,9 +1533,27 @@ impl<W: WriteSeek> FstWriter<W> {
             let encode_payload = |data: &&[u8]| -> Result<(u64, Vec<u8>)> {
                 encode_chain_payload(pack_type, data, compression_level)
             };
+            #[cfg(feature = "gzip")]
+            let max_chain_len = canonical_payloads
+                .iter()
+                .map(|data| data.len())
+                .max()
+                .unwrap_or(0);
+            let encode_serial = || -> Result<Vec<(u64, Vec<u8>)>> {
+                #[cfg(feature = "gzip")]
+                if chain_compression == ChainCompression::Zlib {
+                    let mut encoder = ZlibChainEncoder::new(compression_level, max_chain_len);
+                    return canonical_payloads
+                        .iter()
+                        .map(|data| encoder.encode_owned(data))
+                        .collect();
+                }
+
+                canonical_payloads.iter().map(encode_payload).collect()
+            };
 
             #[cfg(feature = "parallel")]
-            let encoded_payloads: Vec<(u64, Vec<u8>)> = {
+            let encoded_payloads: Option<Vec<(u64, Vec<u8>)>> = {
                 let canonical_bytes: usize = canonical_payloads.iter().map(|data| data.len()).sum();
                 if matches!(
                     chain_compression,
@@ -1542,37 +1562,83 @@ impl<W: WriteSeek> FstWriter<W> {
                     && canonical_bytes >= 64 * 1024
                 {
                     let partition_len = codec_partition_len(canonical_payloads.len());
-                    in_codec_pool(|| {
+                    #[cfg(feature = "gzip")]
+                    if chain_compression == ChainCompression::Zlib {
+                        Some(in_codec_pool(|| {
+                            canonical_payloads
+                                .par_iter()
+                                .with_min_len(partition_len)
+                                .map_init(
+                                    || ZlibChainEncoder::new(compression_level, max_chain_len),
+                                    |encoder, data| encoder.encode_owned(data),
+                                )
+                                .collect::<Result<_>>()
+                        })?)
+                    } else {
+                        Some(in_codec_pool(|| {
+                            canonical_payloads
+                                .par_iter()
+                                .with_min_len(partition_len)
+                                .map(encode_payload)
+                                .collect::<Result<_>>()
+                        })?)
+                    }
+                    #[cfg(not(feature = "gzip"))]
+                    Some(in_codec_pool(|| {
                         canonical_payloads
                             .par_iter()
                             .with_min_len(partition_len)
                             .map(encode_payload)
                             .collect::<Result<_>>()
-                    })?
+                    })?)
                 } else {
-                    canonical_payloads
-                        .iter()
-                        .map(encode_payload)
-                        .collect::<Result<_>>()?
+                    None
                 }
             };
 
             #[cfg(not(feature = "parallel"))]
-            let encoded_payloads: Vec<(u64, Vec<u8>)> = canonical_payloads
-                .iter()
-                .map(encode_payload)
-                .collect::<Result<_>>()?;
+            let encoded_payloads: Option<Vec<(u64, Vec<u8>)>> = None;
 
-            let mut encoded_payloads = encoded_payloads.into_iter();
-            for entry in &mut index_entries {
-                if let ChainIndexEntry::Data { offset } = entry {
-                    let (stored_len, payload_bytes) = encoded_payloads
-                        .next()
-                        .ok_or_else(|| Error::invalid("missing encoded chain payload"))?;
-                    *offset = u64::try_from(chain_buffer.len())
-                        .map_err(|_| Error::invalid("chain buffer exceeds u64 range"))?;
-                    encode_varint(stored_len, &mut chain_buffer);
-                    chain_buffer.extend_from_slice(&payload_bytes);
+            #[cfg(feature = "gzip")]
+            let direct_zlib =
+                chain_compression == ChainCompression::Zlib && encoded_payloads.is_none();
+            #[cfg(not(feature = "gzip"))]
+            let direct_zlib = false;
+
+            if direct_zlib {
+                #[cfg(feature = "gzip")]
+                {
+                    let mut encoder = ZlibChainEncoder::new(compression_level, max_chain_len);
+                    let mut canonical_payloads = canonical_payloads.into_iter();
+                    for entry in &mut index_entries {
+                        if let ChainIndexEntry::Data { offset } = entry {
+                            let data = canonical_payloads
+                                .next()
+                                .ok_or_else(|| Error::invalid("missing zlib chain payload"))?;
+                            let (stored_len, payload) = encoder.encode(data)?;
+                            *offset = u64::try_from(chain_buffer.len())
+                                .map_err(|_| Error::invalid("chain buffer exceeds u64 range"))?;
+                            encode_varint(stored_len, &mut chain_buffer);
+                            chain_buffer.extend_from_slice(payload);
+                        }
+                    }
+                }
+            } else {
+                let mut encoded_payloads = match encoded_payloads {
+                    Some(payloads) => payloads,
+                    None => encode_serial()?,
+                }
+                .into_iter();
+                for entry in &mut index_entries {
+                    if let ChainIndexEntry::Data { offset } = entry {
+                        let (stored_len, payload_bytes) = encoded_payloads
+                            .next()
+                            .ok_or_else(|| Error::invalid("missing encoded chain payload"))?;
+                        *offset = u64::try_from(chain_buffer.len())
+                            .map_err(|_| Error::invalid("chain buffer exceeds u64 range"))?;
+                        encode_varint(stored_len, &mut chain_buffer);
+                        chain_buffer.extend_from_slice(&payload_bytes);
+                    }
                 }
             }
         }
@@ -1660,30 +1726,27 @@ impl<W: WriteSeek> FstWriter<W> {
     }
 
     fn write_geometry_block(&mut self, compress: bool) -> Result<()> {
-        let geom = GeomInfo {
-            max_handle: self.geometry.len() as u64,
-            entries: self.geometry.clone(),
-        };
-        let encoded = geom.encode_block(compress)?;
+        let encoded =
+            GeomInfo::encode_entries(self.geometry.len() as u64, &self.geometry, compress)?;
         self.output.write_all(&[BlockType::Geometry as u8])?;
         self.output.with_writer(|writer| encoded.write_to(writer))?;
         Ok(())
     }
 
     fn write_hierarchy_block(&mut self) -> Result<()> {
-        let block = HierarchyBlock {
-            items: self.hierarchy_items.clone(),
-            scopes: self.scopes.clone(),
-            variables: self.variables.clone(),
-            attributes: self.attributes.clone(),
-        };
         let compression = match self.options.hierarchy_compression {
             HierarchyCompression::Zlib { level } => HierarchyCompression::Zlib {
                 level: self.options.compression_level.unwrap_or(level).min(9),
             },
             other => other,
         };
-        let encoded = block.encode_block(compression)?;
+        let encoded = HierarchyBlock::encode_parts(
+            &self.hierarchy_items,
+            &self.scopes,
+            &self.variables,
+            &self.attributes,
+            compression,
+        )?;
         self.output.write_all(&[encoded.block_type as u8])?;
         self.output.with_writer(|writer| encoded.write_to(writer))?;
         Ok(())

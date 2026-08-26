@@ -151,6 +151,10 @@ Single-threaded raw-chain writing assembles the final block directly without per
 buffers. Dynamic-chain deduplication uses a randomized fast hash while still comparing complete
 chain bytes, so hash collisions cannot change alias correctness.
 
+Zlib value chains reuse encoder state and scratch storage within a block. The encoder selects the
+smallest standards-compliant window that can cover the longest chain, reducing short-chain setup
+cost without changing the compression level or FST representation.
+
 ## Async, SIMD, and serde helpers
 
 - `wavefst::async_support::{AsyncReader, AsyncWriter}` buffer async sources/sinks using `tokio`

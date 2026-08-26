@@ -1,7 +1,7 @@
 #[cfg(feature = "fastlz")]
 use fastlz_sys::fastlz_compress;
 #[cfg(feature = "gzip")]
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
+use flate2::{Compress, Compression, FlushCompress, Status, read::ZlibDecoder, write::ZlibEncoder};
 #[cfg(feature = "lz4")]
 use lz4_flex::block::compress as lz4_compress;
 #[cfg(feature = "fastlz")]
@@ -309,7 +309,7 @@ pub fn encode_chain_payload(
 ) -> Result<(u64, Vec<u8>)> {
     let raw_len = u64::try_from(data.len())
         .map_err(|_| Error::invalid("chain payload exceeds supported length"))?;
-    #[cfg(not(any(feature = "gzip", feature = "lz4", feature = "fastlz")))]
+    #[cfg(not(any(feature = "lz4", feature = "fastlz")))]
     let _ = raw_len;
     if data.is_empty() {
         return Ok((0, Vec::new()));
@@ -327,14 +327,7 @@ pub fn encode_chain_payload(
             }
             #[cfg(feature = "gzip")]
             {
-                if data.len() <= 32 {
-                    return Ok((0, data.to_vec()));
-                }
-                let compressed = zlib_compress(data, compression_level, 4)?;
-                if compressed.len() < data.len() {
-                    return Ok((raw_len, compressed));
-                }
-                Ok((0, data.to_vec()))
+                ZlibChainEncoder::new(compression_level, data.len()).encode_owned(data)
             }
         }
         PackType::Lz4 => {
@@ -370,6 +363,60 @@ pub fn encode_chain_payload(
             }
         }
     }
+}
+
+/// Reusable zlib encoder for independent value chains in one block.
+#[cfg(feature = "gzip")]
+pub(crate) struct ZlibChainEncoder {
+    compressor: Compress,
+    scratch: Vec<u8>,
+}
+
+#[cfg(feature = "gzip")]
+impl ZlibChainEncoder {
+    pub(crate) fn new(compression_level: Option<u32>, max_chain_len: usize) -> Self {
+        let level = Compression::new(compression_level.map(|value| value.min(9)).unwrap_or(4));
+        let compressor =
+            Compress::new_with_window_bits(level, true, zlib_window_bits(max_chain_len));
+        Self {
+            compressor,
+            scratch: Vec::with_capacity(max_chain_len),
+        }
+    }
+
+    pub(crate) fn encode<'a>(&'a mut self, data: &'a [u8]) -> Result<(u64, &'a [u8])> {
+        let raw_len = u64::try_from(data.len())
+            .map_err(|_| Error::invalid("chain payload exceeds supported length"))?;
+        if data.len() <= 32 {
+            return Ok((0, data));
+        }
+
+        self.compressor.reset();
+        self.scratch.clear();
+        self.scratch.reserve(data.len());
+        let status = self
+            .compressor
+            .compress_vec(data, &mut self.scratch, FlushCompress::Finish)
+            .map_err(|error| Error::invalid(format!("zlib chain compression failed: {error}")))?;
+        if status == Status::StreamEnd && self.scratch.len() < data.len() {
+            Ok((raw_len, &self.scratch))
+        } else {
+            Ok((0, data))
+        }
+    }
+
+    pub(crate) fn encode_owned(&mut self, data: &[u8]) -> Result<(u64, Vec<u8>)> {
+        let (stored_len, payload) = self.encode(data)?;
+        Ok((stored_len, payload.to_vec()))
+    }
+}
+
+#[cfg(feature = "gzip")]
+fn zlib_window_bits(max_chain_len: usize) -> u8 {
+    let significant_bits = usize::BITS - max_chain_len.saturating_sub(1).leading_zeros();
+    u8::try_from(significant_bits)
+        .expect("usize bit width fits in u8")
+        .clamp(9, 15)
 }
 
 /// Entry describing the chain index layout for a single handle.
@@ -513,6 +560,51 @@ fn zlib_compress(input: &[u8], level: Option<u32>, default_level: u32) -> Result
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(lvl));
     encoder.write_all(input)?;
     Ok(encoder.finish()?)
+}
+
+#[cfg(all(test, feature = "gzip"))]
+mod tests {
+    use std::io::Read;
+
+    use flate2::read::ZlibDecoder;
+
+    use super::{ZlibChainEncoder, zlib_window_bits};
+
+    #[test]
+    fn chain_window_tracks_input_size_with_valid_zlib_bounds() {
+        assert_eq!(zlib_window_bits(0), 9);
+        assert_eq!(zlib_window_bits(1), 9);
+        assert_eq!(zlib_window_bits(512), 9);
+        assert_eq!(zlib_window_bits(513), 10);
+        assert_eq!(zlib_window_bits(32_768), 15);
+        assert_eq!(zlib_window_bits(usize::MAX), 15);
+    }
+
+    #[test]
+    fn reusable_chain_encoder_round_trips_across_window_boundaries() {
+        for len in [33, 512, 513, 32_768, 32_769] {
+            let input = vec![b'A'; len];
+            let mut encoder = ZlibChainEncoder::new(None, len);
+            let (stored_len, compressed) = encoder.encode_owned(&input).expect("compress chain");
+            assert_eq!(stored_len, len as u64);
+
+            let mut decoded = Vec::new();
+            ZlibDecoder::new(compressed.as_slice())
+                .read_to_end(&mut decoded)
+                .expect("decode chain");
+            assert_eq!(decoded, input);
+
+            let shorter = vec![b'B'; 65];
+            let (stored_len, compressed) =
+                encoder.encode_owned(&shorter).expect("reuse compressor");
+            assert_eq!(stored_len, shorter.len() as u64);
+            let mut decoded = Vec::new();
+            ZlibDecoder::new(compressed.as_slice())
+                .read_to_end(&mut decoded)
+                .expect("decode reused chain");
+            assert_eq!(decoded, shorter);
+        }
+    }
 }
 
 #[cfg(feature = "fastlz")]

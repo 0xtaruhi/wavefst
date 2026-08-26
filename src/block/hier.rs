@@ -181,7 +181,23 @@ impl HierarchyBlock {
 
     /// Encodes the hierarchy block using the provided compression strategy.
     pub fn encode_block(&self, compression: HierarchyCompression) -> Result<EncodedHierarchy> {
-        let raw = self.emit_stream()?;
+        Self::encode_parts(
+            &self.items,
+            &self.scopes,
+            &self.variables,
+            &self.attributes,
+            compression,
+        )
+    }
+
+    pub(crate) fn encode_parts(
+        items: &[HierarchyItem],
+        scopes: &[ScopeEntry],
+        variables: &[VarEntry],
+        attributes: &[AttributeEntry],
+        compression: HierarchyCompression,
+    ) -> Result<EncodedHierarchy> {
+        let raw = Self::emit_parts(items, scopes, variables, attributes)?;
         let uncompressed_len = raw.len() as u64;
         #[cfg(not(any(feature = "gzip", feature = "lz4")))]
         let _ = uncompressed_len;
@@ -404,12 +420,17 @@ impl HierarchyBlock {
         })
     }
 
-    fn emit_stream(&self) -> Result<Vec<u8>> {
+    fn emit_parts(
+        items: &[HierarchyItem],
+        scopes: &[ScopeEntry],
+        variables: &[VarEntry],
+        attributes: &[AttributeEntry],
+    ) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        for item in &self.items {
+        for item in items {
             match *item {
                 HierarchyItem::ScopeBegin { scope_index } => {
-                    let scope = self.scopes.get(scope_index).ok_or_else(|| {
+                    let scope = scopes.get(scope_index).ok_or_else(|| {
                         Error::invalid("hierarchy item references out-of-range scope index")
                     })?;
                     out.push(ScopeType::VcdScope.into());
@@ -421,7 +442,7 @@ impl HierarchyBlock {
                     out.push(ScopeType::VcdUpscope.into());
                 }
                 HierarchyItem::AttributeBegin { attribute_index } => {
-                    let attr = self.attributes.get(attribute_index).ok_or_else(|| {
+                    let attr = attributes.get(attribute_index).ok_or_else(|| {
                         Error::invalid("hierarchy item references out-of-range attribute index")
                     })?;
                     out.push(ScopeType::GenAttrBegin.into());
@@ -434,7 +455,7 @@ impl HierarchyBlock {
                     out.push(ScopeType::GenAttrEnd.into());
                 }
                 HierarchyItem::Var { var_index } => {
-                    let var = self.variables.get(var_index).ok_or_else(|| {
+                    let var = variables.get(var_index).ok_or_else(|| {
                         Error::invalid("hierarchy item references out-of-range variable index")
                     })?;
                     out.push(var.var_type.into());
