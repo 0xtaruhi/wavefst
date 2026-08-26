@@ -159,6 +159,28 @@ fn fold_dense_binary(data: &[u8]) -> usize {
     count
 }
 
+fn fold_dense_binary_selected(
+    data: &[u8],
+    handles: impl IntoIterator<Item = u32>,
+    time_range: std::ops::RangeInclusive<u64>,
+) -> usize {
+    let mut reader = ReaderBuilder::new(Cursor::new(data))
+        .include_handles(handles)
+        .time_range(time_range)
+        .build()
+        .unwrap();
+    let mut count = 0usize;
+    while let Some(changes) = reader.next_value_changes().unwrap() {
+        count = changes
+            .try_fold_binary(count, |count, timestamp, handle, alias, value| {
+                std::hint::black_box((timestamp, handle, alias, value));
+                count + 1
+            })
+            .unwrap();
+    }
+    count
+}
+
 fn bench_placeholder(c: &mut Criterion) {
     #[allow(unused_mut, clippy::useless_vec)]
     let mut configs = vec![("raw", ChainCompression::Raw, TimeCompression::Raw)];
@@ -232,6 +254,24 @@ fn bench_placeholder(c: &mut Criterion) {
     group.bench_function("ordered_binary_fold", |b| {
         b.iter(|| {
             std::hint::black_box(fold_dense_binary(&dense));
+        });
+    });
+    group.bench_function("selected_handle", |b| {
+        b.iter(|| {
+            std::hint::black_box(fold_dense_binary_selected(
+                &dense,
+                [DENSE_SIGNALS as u32],
+                0..=u64::MAX,
+            ));
+        });
+    });
+    group.bench_function("selected_handle_and_time_window", |b| {
+        b.iter(|| {
+            std::hint::black_box(fold_dense_binary_selected(
+                &dense,
+                [DENSE_SIGNALS as u32],
+                32..=63,
+            ));
         });
     });
     #[cfg(feature = "lz4")]

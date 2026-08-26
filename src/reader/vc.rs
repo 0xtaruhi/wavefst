@@ -1,5 +1,5 @@
 use std::io::{Read, Seek, SeekFrom};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -28,7 +28,7 @@ pub struct VcBlockMeta {
     pub header: VcBlock,
     /// Decoded frame section containing values at the block boundary.
     pub frame: FrameSection,
-    /// Original stored/raw chain payload arena.
+    /// Stored/raw chain payload arena; compacted to selected chains when filtered.
     pub chain_buffer: Vec<u8>,
     /// Arena containing chains that required decompression.
     pub decoded_chain_buffer: Vec<u8>,
@@ -42,6 +42,10 @@ pub struct VcBlockMeta {
     pub index: ChainIndex,
     /// Byte order used to decode real-valued changes.
     pub double_byte_order: FstByteOrder,
+    /// Normalized one-based handle filter used to decode this block, if any.
+    pub included_handles: Option<Vec<u32>>,
+    /// Inclusive timestamp range applied while traversing this block, if any.
+    pub time_range: Option<RangeInclusive<u64>>,
 }
 
 /// Resolved per-handle chain metadata extracted from the block index.
@@ -90,6 +94,20 @@ pub enum ChainPayload {
     },
 }
 
+pub(crate) struct VcParseOptions<'a> {
+    pub max_block_bytes: u64,
+    pub max_handles: u64,
+    pub double_byte_order: FstByteOrder,
+    pub included_handles: Option<&'a [u32]>,
+    pub time_range: Option<RangeInclusive<u64>>,
+}
+
+struct ChainStorage {
+    stored: Vec<u8>,
+    chains: Vec<Option<ChainData>>,
+    decoded: Vec<u8>,
+}
+
 impl ChainPayload {
     /// Returns a view of the payload as a byte slice, borrowing when possible.
     pub fn as_slice<'a>(&self, backing: &'a [u8], decoded_backing: &'a [u8]) -> &'a [u8] {
@@ -121,9 +139,7 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
     block_type: BlockType,
     section_start: u64,
     payload_len: u64,
-    max_block_bytes: u64,
-    max_handles: u64,
-    double_byte_order: FstByteOrder,
+    options: VcParseOptions<'_>,
 ) -> Result<VcBlockMeta> {
     if payload_len < 61 {
         return Err(Error::invalid(
@@ -140,7 +156,8 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
     let (frame_compressed_len, _) = read_varint_from_reader(reader)?;
     let (frame_max_handle, _) = read_varint_from_reader(reader)?;
 
-    if required_memory > max_block_bytes || frame_uncompressed_len > max_block_bytes {
+    if required_memory > options.max_block_bytes || frame_uncompressed_len > options.max_block_bytes
+    {
         return Err(Error::invalid(
             "decoded value-change data exceeds configured block limit",
         ));
@@ -170,10 +187,10 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
     )?;
 
     let (vc_max_handle, _) = read_varint_from_reader(reader)?;
-    if vc_max_handle > max_handles || vc_max_handle > u64::from(u32::MAX) {
+    if vc_max_handle > options.max_handles || vc_max_handle > u64::from(u32::MAX) {
         return Err(Error::invalid(format!(
             "value-change block declares {vc_max_handle} handles, above supported/configured limit {}",
-            max_handles.min(u64::from(u32::MAX))
+            options.max_handles.min(u64::from(u32::MAX))
         )));
     }
     let vc_max_handle_usize = usize::try_from(vc_max_handle)
@@ -193,7 +210,9 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
     let time_uncompressed_len = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
     let time_compressed_len = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
     let time_item_count = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
-    if time_uncompressed_len > max_block_bytes || time_compressed_len > max_block_bytes {
+    if time_uncompressed_len > options.max_block_bytes
+        || time_compressed_len > options.max_block_bytes
+    {
         return Err(Error::invalid("time table exceeds configured block limit"));
     }
 
@@ -213,7 +232,7 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
         .ok_or_else(|| Error::invalid("missing index length trailer"))?;
     reader.seek(SeekFrom::Start(index_length_pos))?;
     let index_length = u64::from_be_bytes(crate::util::read_array::<8, _>(reader)?);
-    if index_length > max_block_bytes {
+    if index_length > options.max_block_bytes {
         return Err(Error::invalid("chain index exceeds configured block limit"));
     }
 
@@ -257,36 +276,134 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
     }
     let time_table = TimeTable::decode(&time_section, time_bytes)?;
 
-    let chain_span = chain_end
-        .checked_sub(chain_start)
-        .ok_or_else(|| Error::invalid("negative chain range"))?;
-    let chain_len = usize::try_from(chain_span)
-        .map_err(|_| Error::invalid("chain buffer exceeds addressable memory"))?;
-    reader.seek(SeekFrom::Start(chain_start))?;
-    let mut chain_buffer = vec![0u8; chain_len];
-    if chain_len > 0 {
-        reader.read_exact(&mut chain_buffer)?;
-    }
+    let storage = match options.included_handles {
+        None => {
+            let chain_span = chain_end
+                .checked_sub(chain_start)
+                .ok_or_else(|| Error::invalid("negative chain range"))?;
+            let chain_len = usize::try_from(chain_span)
+                .map_err(|_| Error::invalid("chain buffer exceeds addressable memory"))?;
+            reader.seek(SeekFrom::Start(chain_start))?;
+            let mut chain_buffer = vec![0u8; chain_len];
+            if chain_len > 0 {
+                reader.read_exact(&mut chain_buffer)?;
+            }
+            let (chains, decoded_chain_buffer) = build_chains(
+                &chain_buffer,
+                chain_start,
+                &index,
+                header.pack_marker.pack_type,
+            )?;
+            ChainStorage {
+                stored: chain_buffer,
+                chains,
+                decoded: decoded_chain_buffer,
+            }
+        }
+        Some(handles) => {
+            read_selected_chains(reader, &index, handles, header.pack_marker.pack_type)?
+        }
+    };
 
     reader.seek(SeekFrom::Start(block_end))?;
-
-    let (chains, decoded_chain_buffer) = build_chains(
-        &chain_buffer,
-        chain_start,
-        &index,
-        header.pack_marker.pack_type,
-    )?;
 
     Ok(VcBlockMeta {
         header,
         frame,
-        chain_buffer,
-        decoded_chain_buffer,
-        chains,
+        chain_buffer: storage.stored,
+        decoded_chain_buffer: storage.decoded,
+        chains: storage.chains,
         time_section,
         time_table,
         index,
-        double_byte_order,
+        double_byte_order: options.double_byte_order,
+        included_handles: options.included_handles.map(<[u32]>::to_vec),
+        time_range: options.time_range,
+    })
+}
+
+fn read_selected_chains<R: Read + Seek>(
+    reader: &mut R,
+    index: &ChainIndex,
+    included_handles: &[u32],
+    pack_type: PackType,
+) -> Result<ChainStorage> {
+    let mut canonical_needed = vec![false; index.slots.len()];
+    for &handle in included_handles {
+        let handle_index = (handle - 1) as usize;
+        let Some(slot) = index.slots.get(handle_index).and_then(Option::as_ref) else {
+            continue;
+        };
+        let canonical = slot.alias_of.unwrap_or(handle);
+        let canonical_index = (canonical - 1) as usize;
+        if canonical_index >= canonical_needed.len() {
+            return Err(Error::decode("dynamic alias target exceeds chain index"));
+        }
+        canonical_needed[canonical_index] = true;
+    }
+
+    let mut chain_buffer = Vec::new();
+    let mut filtered_slots = vec![None; index.slots.len()];
+    let mut canonical_locations = vec![None; index.slots.len()];
+    for (handle_index, needed) in canonical_needed.into_iter().enumerate() {
+        if !needed {
+            continue;
+        }
+        let slot = index.slots[handle_index]
+            .as_ref()
+            .ok_or_else(|| Error::decode("selected canonical handle has no chain slot"))?;
+        if slot.alias_of.is_some() {
+            return Err(Error::decode("resolved canonical chain is still an alias"));
+        }
+        let length = usize::try_from(slot.length)
+            .map_err(|_| Error::decode("chain length exceeds addressable memory"))?;
+        let compact_offset = u64::try_from(chain_buffer.len())
+            .map_err(|_| Error::decode("selected chain arena exceeds u64 range"))?;
+        let end = chain_buffer
+            .len()
+            .checked_add(length)
+            .ok_or_else(|| Error::decode("selected chain arena length overflow"))?;
+        chain_buffer.resize(end, 0);
+        reader.seek(SeekFrom::Start(slot.offset))?;
+        reader.read_exact(&mut chain_buffer[end - length..end])?;
+        let compact_slot = ChainSlot {
+            offset: compact_offset,
+            length: slot.length,
+            alias_of: None,
+        };
+        filtered_slots[handle_index] = Some(compact_slot);
+        canonical_locations[handle_index] = Some((compact_offset, slot.length));
+    }
+
+    for &handle in included_handles {
+        let handle_index = (handle - 1) as usize;
+        let Some(slot) = index.slots.get(handle_index).and_then(Option::as_ref) else {
+            continue;
+        };
+        let Some(canonical) = slot.alias_of else {
+            continue;
+        };
+        let canonical_index = (canonical - 1) as usize;
+        let (offset, length) = canonical_locations
+            .get(canonical_index)
+            .and_then(|location| *location)
+            .ok_or_else(|| Error::decode("selected alias target has no loaded chain"))?;
+        filtered_slots[handle_index] = Some(ChainSlot {
+            offset,
+            length,
+            alias_of: Some(canonical),
+        });
+    }
+
+    let filtered_index = ChainIndex {
+        slots: filtered_slots,
+    };
+    let (chains, decoded_chain_buffer) =
+        build_chains(&chain_buffer, 0, &filtered_index, pack_type)?;
+    Ok(ChainStorage {
+        stored: chain_buffer,
+        chains,
+        decoded: decoded_chain_buffer,
     })
 }
 

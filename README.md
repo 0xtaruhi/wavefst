@@ -18,6 +18,8 @@ aliases, block checkpoints, static alias handles, and whole-file gzip wrappers.
   static aliases and optional `FST_BL_ZWRAPPER` output.
 - **Bounded streaming** – writers automatically split large change sets into checkpointed VC blocks;
   readers expose configurable decompression and per-block safety limits.
+- **Indexed selective reads** – readers can restrict handles and inclusive time ranges, seek directly
+  to selected chains, and skip non-overlapping value-change blocks without decompressing them.
 - **Selectable compression** – uncompressed chains plus zlib, LZ4, and FastLZ payloads are supported
   behind feature flags. Raw chains still use the standard `'Z'` block marker.
 - **Async, SIMD, serde** – optional helpers wrap the synchronous APIs for async I/O, fast ASCII→bit
@@ -62,6 +64,32 @@ fn dump_changes(path: &str) -> wavefst::Result<()> {
     Ok(())
 }
 ```
+
+When only part of a waveform is needed, configure the selection before building the reader:
+
+```rust
+use wavefst::ReaderBuilder;
+
+fn read_window(path: &str) -> wavefst::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = ReaderBuilder::new(file)
+        .include_handles([1, 7, 42])
+        .time_range(1_000..=2_000)
+        .build()?;
+
+    while let Some(changes) = reader.next_value_changes()? {
+        changes.try_for_each_parts(|timestamp, handle, alias_of, value| {
+            println!("{timestamp} {handle} {alias_of:?} {value:?}");
+        })?;
+    }
+    Ok(())
+}
+```
+
+Handles are one-based. The time range is inclusive. The reader still decodes the compact chain
+index and the relevant time tables, but reads and decompresses only selected chain payloads;
+value-change blocks wholly outside the requested range are seek-skipped. Omitting both filters uses
+the original contiguous full-scan path.
 
 For handle-major analysis that does not require global timestamp ordering, use
 `try_for_each_parts_unordered`. With the default `parallel` feature, reductions can avoid shared
@@ -169,6 +197,10 @@ choose ordered `try_for_each_parts`, cache-friendly handle-major `try_for_each_p
 parallel thread-local `try_fold_parts_parallel`; ordered scalar reductions can use `try_fold_parts`
 or the two-state `try_fold_binary` specialization. All retain bounds and format validation. Dense
 single-bit writers should prefer `emit_binary_batch`.
+
+Sparse consumers should set `include_handles` before opening the value-change stream instead of
+decoding every chain and filtering callbacks afterward. It uses the FST chain index for direct
+payload reads and also handles dynamic aliases without emitting an unselected canonical signal.
 
 Large independent chain codecs use a lazily initialized pool capped at 32 workers, preventing
 many-core hosts from spending more time on Rayon work stealing than on short FST streams. Explicit

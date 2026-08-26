@@ -1,6 +1,7 @@
 //! High-level streaming reader for FST files.
 
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::ops::RangeInclusive;
 
 use crate::block::{BlackoutBlock, GeomInfo, Header, HierarchyBlock};
 #[cfg(feature = "gzip")]
@@ -11,8 +12,8 @@ use crate::types::BlockType;
 use crate::util::{read_u64_be, skip_bytes};
 
 mod vc;
-use vc::parse_vc_block;
 pub use vc::{ChainData, ChainIndex, ChainPayload, ChainSlot, VcBlockMeta};
+use vc::{VcParseOptions, parse_vc_block};
 
 mod change;
 pub use change::{ValueChange, VcBlockChanges, build_changes};
@@ -28,6 +29,11 @@ pub struct ReaderOptions {
     pub max_block_bytes: u64,
     /// Maximum number of canonical signal handles accepted from an input file.
     pub max_handles: u64,
+    /// Optional sorted set of one-based handles whose changes should be decoded and emitted.
+    /// `None` selects every handle; `Some(Vec::new())` selects none.
+    pub included_handles: Option<Vec<u32>>,
+    /// Optional inclusive timestamp range. Blocks outside the range are skipped without decoding.
+    pub time_range: Option<RangeInclusive<u64>>,
 }
 
 impl Default for ReaderOptions {
@@ -37,6 +43,8 @@ impl Default for ReaderOptions {
             max_decompressed_bytes: 8 * 1024 * 1024 * 1024,
             max_block_bytes: 4 * 1024 * 1024 * 1024,
             max_handles: 16_777_216,
+            included_handles: None,
+            time_range: None,
         }
     }
 }
@@ -87,6 +95,27 @@ impl<R: ReadSeek> ReaderBuilder<R> {
         self
     }
 
+    /// Restricts decoding and emission to the supplied one-based signal handles.
+    ///
+    /// Handles are sorted and deduplicated while building the reader. Passing an empty iterator
+    /// is valid and produces metadata without any value changes.
+    pub fn include_handles<I>(mut self, handles: I) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.options.included_handles = Some(handles.into_iter().collect());
+        self
+    }
+
+    /// Restricts emitted changes to an inclusive timestamp range.
+    ///
+    /// Value-change blocks that do not overlap the range are skipped without reading their frame,
+    /// time table, chain payloads, or index. An empty range is valid and emits no changes.
+    pub fn time_range(mut self, range: RangeInclusive<u64>) -> Self {
+        self.options.time_range = Some(range);
+        self
+    }
+
     /// Consumes the builder, constructing the reader.
     pub fn build(self) -> Result<FstReader<R>> {
         FstReader::with_backend(self.source, self.options)
@@ -105,7 +134,7 @@ pub struct FstReader<R: ReadSeek> {
 }
 
 impl<R: ReadSeek> FstReader<R> {
-    fn with_backend(mut source: R, options: ReaderOptions) -> Result<Self> {
+    fn with_backend(mut source: R, mut options: ReaderOptions) -> Result<Self> {
         source.seek(SeekFrom::Start(0))?;
         let mut tag = [0u8; 1];
         source.read_exact(&mut tag)?;
@@ -124,6 +153,33 @@ impl<R: ReadSeek> FstReader<R> {
                 header.max_handle,
                 options.max_handles.min(u64::from(u32::MAX))
             )));
+        }
+        if let Some(handles) = options.included_handles.as_mut() {
+            handles.sort_unstable();
+            handles.dedup();
+            if handles.first() == Some(&0) {
+                return Err(Error::invalid(
+                    "included handles are one-based; handle 0 is invalid",
+                ));
+            }
+            if handles
+                .last()
+                .is_some_and(|handle| u64::from(*handle) > header.max_handle)
+            {
+                return Err(Error::invalid(format!(
+                    "included handle {} exceeds the file's maximum handle {}",
+                    handles.last().expect("checked as present"),
+                    header.max_handle
+                )));
+            }
+        }
+        if header.max_handle != 0
+            && options
+                .included_handles
+                .as_ref()
+                .is_some_and(|handles| u64::try_from(handles.len()).ok() == Some(header.max_handle))
+        {
+            options.included_handles = None;
         }
         let mut reader = Self {
             backend,
@@ -205,18 +261,42 @@ impl<R: ReadSeek> FstReader<R> {
                     let section_start = reader.stream_position()?;
                     let payload_len = payload_length(section_length)?;
                     validate_block_size(section_length, self.options.max_block_bytes)?;
+                    let block_end = section_start.checked_add(payload_len).ok_or_else(|| {
+                        Error::invalid("value-change payload exceeds file bounds")
+                    })?;
+                    if let Some(range) = self.options.time_range.as_ref() {
+                        if payload_len < 61 {
+                            return Err(Error::invalid(
+                                "value-change payload shorter than required fields",
+                            ));
+                        }
+                        let begin_time = read_u64_be(reader)?;
+                        let end_time = read_u64_be(reader)?;
+                        reader.seek(SeekFrom::Start(section_start))?;
+                        if !time_ranges_overlap(begin_time, end_time, range) {
+                            let source_end = reader.seek(SeekFrom::End(0))?;
+                            if block_end > source_end {
+                                return Err(Error::invalid(
+                                    "value-change payload exceeds file bounds",
+                                ));
+                            }
+                            reader.seek(SeekFrom::Start(block_end))?;
+                            continue;
+                        }
+                    }
                     let meta = parse_vc_block(
                         reader,
                         block_type,
                         section_start,
                         payload_len,
-                        self.options.max_block_bytes,
-                        self.options.max_handles,
-                        self.header.double_byte_order,
+                        VcParseOptions {
+                            max_block_bytes: self.options.max_block_bytes,
+                            max_handles: self.options.max_handles,
+                            double_byte_order: self.header.double_byte_order,
+                            included_handles: self.options.included_handles.as_deref(),
+                            time_range: self.options.time_range.clone(),
+                        },
                     )?;
-                    let block_end = section_start.checked_add(payload_len).ok_or_else(|| {
-                        Error::invalid("value-change payload exceeds file bounds")
-                    })?;
                     reader.seek(SeekFrom::Start(block_end))?;
                     return Ok(Some(meta));
                 }
@@ -464,4 +544,9 @@ fn validate_block_size(section_length: u64, limit: u64) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[inline]
+fn time_ranges_overlap(begin_time: u64, end_time: u64, range: &RangeInclusive<u64>) -> bool {
+    range.start() <= range.end() && end_time >= *range.start() && begin_time <= *range.end()
 }

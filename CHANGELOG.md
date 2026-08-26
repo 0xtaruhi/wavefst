@@ -4,12 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.2.2 - 2026-08-26
+
+### Added
+
+- Added `ReaderBuilder::include_handles` and `ReaderBuilder::time_range` for indexed selective
+  reads that seek directly to requested chains and skip non-overlapping value-change blocks.
+- Added codec, dynamic-alias, time-boundary, traversal-mode, and real-libfst regression coverage
+  for selective reads, plus Criterion benchmarks for sparse workloads.
+
 ### Changed
 
 - Decode serial zlib value chains directly into their final arena, eliminating one allocation and
   copy per compressed chain.
 - Inline the common one-byte varint decoder while keeping multi-byte validation in an outlined
   slow path.
+- Preserve the original contiguous full-scan path when no filter is configured or every handle is
+  selected.
 
 ## 0.2.1 - 2026-08-26
 

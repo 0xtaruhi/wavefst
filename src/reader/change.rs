@@ -46,6 +46,7 @@ impl SignalKind {
 #[derive(Debug)]
 struct ChainCursor<'a> {
     handle: u32,
+    emit_canonical: bool,
     kind: SignalKind,
     data: &'a [u8],
     offset: usize,
@@ -55,9 +56,16 @@ struct ChainCursor<'a> {
 }
 
 impl<'a> ChainCursor<'a> {
-    fn new(handle: u32, kind: SignalKind, data: &'a [u8], double_byte_order: FstByteOrder) -> Self {
+    fn new(
+        handle: u32,
+        emit_canonical: bool,
+        kind: SignalKind,
+        data: &'a [u8],
+        double_byte_order: FstByteOrder,
+    ) -> Self {
         Self {
             handle,
+            emit_canonical,
             kind,
             data,
             offset: 0,
@@ -251,6 +259,21 @@ impl<'a> ChainCursor<'a> {
             }
         }
     }
+
+    fn skip_before(&mut self, first_time_index: usize) -> Result<()> {
+        while let Some(delta) = self.peek_delta()? {
+            let next_time_index = self
+                .current_time_index
+                .checked_add(delta)
+                .ok_or_else(|| Error::decode("chain time index overflow"))?;
+            if next_time_index >= first_time_index {
+                break;
+            }
+            self.read_value(next_time_index)?
+                .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +298,7 @@ pub struct VcBlockChanges<'a> {
     pending_aliases: VecDeque<ValueChange<'a>>,
     alias_map: Vec<Vec<u32>>,
     time_index: usize,
+    end_time_index: usize,
 }
 
 impl<'a> VcBlockChanges<'a> {
@@ -284,6 +308,22 @@ impl<'a> VcBlockChanges<'a> {
         geom: &'a GeomInfo,
         alias_index: &'a ChainIndex,
     ) -> Result<Self> {
+        let time_len = block.time_table.timestamps.len();
+        let (start_time_index, end_time_index) = match block.time_range.as_ref() {
+            None => (0, time_len),
+            Some(range) if range.start() > range.end() => (0, 0),
+            Some(range) => (
+                block
+                    .time_table
+                    .timestamps
+                    .partition_point(|timestamp| timestamp < range.start()),
+                block
+                    .time_table
+                    .timestamps
+                    .partition_point(|timestamp| timestamp <= range.end()),
+            ),
+        };
+        let included_handles = block.included_handles.as_deref();
         let mut cursors = Vec::new();
         for (idx, chain_opt) in block.chains.iter().enumerate() {
             let Some(chain) = chain_opt else {
@@ -293,6 +333,8 @@ impl<'a> VcBlockChanges<'a> {
                 continue;
             }
             let handle = (idx + 1) as u32;
+            let emit_canonical =
+                included_handles.is_none_or(|handles| handles.binary_search(&handle).is_ok());
             let geom_entry = geom.entry(handle).ok_or_else(|| {
                 Error::invalid(format!("missing geometry entry for handle {handle}"))
             })?;
@@ -301,25 +343,30 @@ impl<'a> VcBlockChanges<'a> {
                 ChainPayload::Borrowed { range } => &block.chain_buffer[range.clone()],
                 ChainPayload::Decoded { range } => &block.decoded_chain_buffer[range.clone()],
             };
-            cursors.push(ChainCursor::new(
-                handle,
-                kind,
-                data,
-                block.double_byte_order,
-            ));
+            let mut cursor =
+                ChainCursor::new(handle, emit_canonical, kind, data, block.double_byte_order);
+            if start_time_index != 0 {
+                cursor.skip_before(start_time_index)?;
+            }
+            cursors.push(cursor);
         }
 
-        let time_len = block.time_table.timestamps.len();
-        let mut schedule_heads = vec![NO_CURSOR; time_len];
+        let mut schedule_heads = vec![NO_CURSOR; end_time_index];
         let mut schedule_next = vec![NO_CURSOR; cursors.len()];
 
         for (idx, cursor) in cursors.iter_mut().enumerate() {
             if let Some(delta) = cursor.peek_delta()? {
-                if delta >= time_len {
+                let next_time_index = cursor
+                    .current_time_index
+                    .checked_add(delta)
+                    .ok_or_else(|| Error::decode("chain time index overflow"))?;
+                if next_time_index >= time_len {
                     return Err(Error::decode("initial chain delta exceeds time table"));
                 }
-                schedule_next[idx] = schedule_heads[delta];
-                schedule_heads[delta] = idx;
+                if next_time_index < end_time_index {
+                    schedule_next[idx] = schedule_heads[next_time_index];
+                    schedule_heads[next_time_index] = idx;
+                }
             }
         }
 
@@ -329,7 +376,10 @@ impl<'a> VcBlockChanges<'a> {
                 continue;
             };
             if let Some(canon) = slot.alias_of {
-                alias_map[canon as usize].push((slot_idx + 1) as u32);
+                let alias = (slot_idx + 1) as u32;
+                if included_handles.is_none_or(|handles| handles.binary_search(&alias).is_ok()) {
+                    alias_map[canon as usize].push(alias);
+                }
             }
         }
 
@@ -340,7 +390,8 @@ impl<'a> VcBlockChanges<'a> {
             schedule_next,
             pending_aliases: VecDeque::new(),
             alias_map,
-            time_index: 0,
+            time_index: start_time_index,
+            end_time_index,
         })
     }
 
@@ -368,16 +419,18 @@ impl<'a> VcBlockChanges<'a> {
                     .time_index
                     .checked_add(next_delta)
                     .ok_or_else(|| Error::decode("chain delta overflow"))?;
-                if next_time >= self.schedule_heads.len() {
+                if next_time >= self.block.time_table.timestamps.len() {
                     return Err(Error::decode("chain delta exceeds time table"));
                 }
-                self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
-                self.schedule_heads[next_time] = cursor_idx;
+                if next_time < self.schedule_heads.len() {
+                    self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                    self.schedule_heads[next_time] = cursor_idx;
+                }
             }
 
             let handle = cursor.handle;
             let aliases = &self.alias_map[handle as usize];
-            if aliases.is_empty() {
+            if cursor.emit_canonical && aliases.is_empty() {
                 visitor(ValueChange {
                     timestamp,
                     handle,
@@ -387,12 +440,14 @@ impl<'a> VcBlockChanges<'a> {
                 continue;
             }
 
-            visitor(ValueChange {
-                timestamp,
-                handle,
-                alias_of: None,
-                value: value.clone(),
-            });
+            if cursor.emit_canonical {
+                visitor(ValueChange {
+                    timestamp,
+                    handle,
+                    alias_of: None,
+                    value: value.clone(),
+                });
+            }
             for &alias in aliases {
                 visitor(ValueChange {
                     timestamp,
@@ -445,23 +500,27 @@ impl<'a> VcBlockChanges<'a> {
                         .time_index
                         .checked_add(next_delta)
                         .ok_or_else(|| Error::decode("chain delta overflow"))?;
-                    if next_time >= self.schedule_heads.len() {
+                    if next_time >= self.block.time_table.timestamps.len() {
                         return Err(Error::decode("chain delta exceeds time table"));
                     }
-                    if next_time == self.time_index {
-                        self.schedule_next[cursor_idx] = next_cursor;
-                    } else {
-                        self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
-                        self.schedule_heads[next_time] = cursor_idx;
+                    if next_time < self.schedule_heads.len() {
+                        if next_time == self.time_index {
+                            self.schedule_next[cursor_idx] = next_cursor;
+                        } else {
+                            self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                            self.schedule_heads[next_time] = cursor_idx;
+                        }
                     }
                 }
 
                 let handle = cursor.handle;
                 let aliases = &self.alias_map[handle as usize];
-                if aliases.is_empty() {
+                if cursor.emit_canonical && aliases.is_empty() {
                     accumulator = fold(accumulator, timestamp, handle, None, value);
                 } else {
-                    accumulator = fold(accumulator, timestamp, handle, None, value.clone());
+                    if cursor.emit_canonical {
+                        accumulator = fold(accumulator, timestamp, handle, None, value.clone());
+                    }
                     for &alias in aliases {
                         accumulator =
                             fold(accumulator, timestamp, alias, Some(handle), value.clone());
@@ -516,20 +575,24 @@ impl<'a> VcBlockChanges<'a> {
                         .time_index
                         .checked_add(next_delta)
                         .ok_or_else(|| Error::decode("chain delta overflow"))?;
-                    if next_time >= self.schedule_heads.len() {
+                    if next_time >= self.block.time_table.timestamps.len() {
                         return Err(Error::decode("chain delta exceeds time table"));
                     }
-                    if next_time == self.time_index {
-                        self.schedule_next[cursor_idx] = next_cursor;
-                    } else {
-                        self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
-                        self.schedule_heads[next_time] = cursor_idx;
+                    if next_time < self.schedule_heads.len() {
+                        if next_time == self.time_index {
+                            self.schedule_next[cursor_idx] = next_cursor;
+                        } else {
+                            self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                            self.schedule_heads[next_time] = cursor_idx;
+                        }
                     }
                 }
 
                 let handle = cursor.handle;
                 let aliases = &self.alias_map[handle as usize];
-                accumulator = fold(accumulator, timestamp, handle, None, value);
+                if cursor.emit_canonical {
+                    accumulator = fold(accumulator, timestamp, handle, None, value);
+                }
                 for &alias in aliases {
                     accumulator = fold(accumulator, timestamp, alias, Some(handle), value);
                 }
@@ -560,6 +623,12 @@ impl<'a> VcBlockChanges<'a> {
                     .current_time_index
                     .checked_add(delta)
                     .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                if time_index >= self.block.time_table.timestamps.len() {
+                    return Err(Error::decode("chain delta exceeds time table"));
+                }
+                if time_index >= self.end_time_index {
+                    break;
+                }
                 let timestamp = *self
                     .block
                     .time_table
@@ -569,11 +638,13 @@ impl<'a> VcBlockChanges<'a> {
                 let value = cursor
                     .read_value(time_index)?
                     .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
-                if aliases.is_empty() {
+                if cursor.emit_canonical && aliases.is_empty() {
                     visitor(timestamp, handle, None, value);
                     continue;
                 }
-                visitor(timestamp, handle, None, value.clone());
+                if cursor.emit_canonical {
+                    visitor(timestamp, handle, None, value.clone());
+                }
                 for &alias in aliases {
                     visitor(timestamp, alias, Some(handle), value.clone());
                 }
@@ -591,6 +662,7 @@ impl<'a> VcBlockChanges<'a> {
     {
         let timestamps = &self.block.time_table.timestamps;
         let aliases = &self.alias_map;
+        let end_time_index = self.end_time_index;
         self.cursors
             .into_par_iter()
             .try_for_each(|mut cursor| -> Result<()> {
@@ -601,17 +673,25 @@ impl<'a> VcBlockChanges<'a> {
                         .current_time_index
                         .checked_add(delta)
                         .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                    if time_index >= timestamps.len() {
+                        return Err(Error::decode("chain delta exceeds time table"));
+                    }
+                    if time_index >= end_time_index {
+                        break;
+                    }
                     let timestamp = *timestamps
                         .get(time_index)
                         .ok_or_else(|| Error::decode("chain delta exceeds time table"))?;
                     let value = cursor
                         .read_value(time_index)?
                         .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
-                    if handle_aliases.is_empty() {
+                    if cursor.emit_canonical && handle_aliases.is_empty() {
                         visitor(timestamp, handle, None, value);
                         continue;
                     }
-                    visitor(timestamp, handle, None, value.clone());
+                    if cursor.emit_canonical {
+                        visitor(timestamp, handle, None, value.clone());
+                    }
                     for &alias in handle_aliases {
                         visitor(timestamp, alias, Some(handle), value.clone());
                     }
@@ -637,6 +717,7 @@ impl<'a> VcBlockChanges<'a> {
     {
         let timestamps = &self.block.time_table.timestamps;
         let aliases = &self.alias_map;
+        let end_time_index = self.end_time_index;
         let init_ref = &init;
         self.cursors
             .into_par_iter()
@@ -649,17 +730,25 @@ impl<'a> VcBlockChanges<'a> {
                         .current_time_index
                         .checked_add(delta)
                         .ok_or_else(|| Error::decode("chain delta overflow"))?;
+                    if time_index >= timestamps.len() {
+                        return Err(Error::decode("chain delta exceeds time table"));
+                    }
+                    if time_index >= end_time_index {
+                        break;
+                    }
                     let timestamp = *timestamps
                         .get(time_index)
                         .ok_or_else(|| Error::decode("chain delta exceeds time table"))?;
                     let value = cursor
                         .read_value(time_index)?
                         .ok_or_else(|| Error::decode("scheduled chain ended unexpectedly"))?;
-                    if handle_aliases.is_empty() {
+                    if cursor.emit_canonical && handle_aliases.is_empty() {
                         fold(&mut accumulator, timestamp, handle, None, value);
                         continue;
                     }
-                    fold(&mut accumulator, timestamp, handle, None, value.clone());
+                    if cursor.emit_canonical {
+                        fold(&mut accumulator, timestamp, handle, None, value.clone());
+                    }
                     for &alias in handle_aliases {
                         fold(
                             &mut accumulator,
@@ -705,11 +794,13 @@ impl<'a> VcBlockChanges<'a> {
                     .time_index
                     .checked_add(next_delta)
                     .ok_or_else(|| Error::decode("chain delta overflow"))?;
-                if next_time >= self.schedule_heads.len() {
+                if next_time >= self.block.time_table.timestamps.len() {
                     return Err(Error::decode("chain delta exceeds time table"));
                 }
-                self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
-                self.schedule_heads[next_time] = cursor_idx;
+                if next_time < self.schedule_heads.len() {
+                    self.schedule_next[cursor_idx] = self.schedule_heads[next_time];
+                    self.schedule_heads[next_time] = cursor_idx;
+                }
             }
 
             let handle = cursor.handle;
@@ -723,12 +814,17 @@ impl<'a> VcBlockChanges<'a> {
                     });
                 }
             }
-            return Ok(Some(ValueChange {
-                timestamp,
-                handle,
-                alias_of: None,
-                value,
-            }));
+            if cursor.emit_canonical {
+                return Ok(Some(ValueChange {
+                    timestamp,
+                    handle,
+                    alias_of: None,
+                    value,
+                }));
+            }
+            if let Some(alias) = self.pending_aliases.pop_front() {
+                return Ok(Some(alias));
+            }
         }
     }
 }
