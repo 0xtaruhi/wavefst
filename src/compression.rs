@@ -1,6 +1,18 @@
+use std::cell::RefCell;
+
 use libdeflater::{CompressionLvl, Compressor, Decompressor};
 
 use crate::error::{Error, Result};
+
+thread_local! {
+    static DECOMPRESSOR: RefCell<Decompressor> = RefCell::new(Decompressor::new());
+}
+
+pub(crate) fn with_decompressor<T>(
+    decode: impl FnOnce(&mut Decompressor) -> Result<T>,
+) -> Result<T> {
+    DECOMPRESSOR.with(|decompressor| decode(&mut decompressor.borrow_mut()))
+}
 
 pub(crate) fn compressor(level: u32) -> Compressor {
     let level = i32::try_from(level.min(9)).expect("compression level fits in i32");
@@ -31,8 +43,7 @@ pub(crate) fn gzip_compress(input: &[u8], level: u32) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn zlib_decompress(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
-    let mut decompressor = Decompressor::new();
-    zlib_decompress_with(&mut decompressor, input, expected_len)
+    with_decompressor(|decompressor| zlib_decompress_with(decompressor, input, expected_len))
 }
 
 pub(crate) fn zlib_decompress_with(
@@ -60,15 +71,16 @@ pub(crate) fn zlib_decompress_into_with(
 }
 
 pub(crate) fn gzip_decompress(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
-    let mut decompressor = Decompressor::new();
-    let mut output = vec![0_u8; expected_len];
-    let written = decompressor
-        .gzip_decompress(input, &mut output)
-        .map_err(|error| Error::decode(format!("gzip decompression failed: {error}")))?;
-    if written != expected_len {
-        return Err(Error::decode("gzip decompressed length mismatch"));
-    }
-    Ok(output)
+    with_decompressor(|decompressor| {
+        let mut output = vec![0_u8; expected_len];
+        let written = decompressor
+            .gzip_decompress(input, &mut output)
+            .map_err(|error| Error::decode(format!("gzip decompression failed: {error}")))?;
+        if written != expected_len {
+            return Err(Error::decode("gzip decompressed length mismatch"));
+        }
+        Ok(output)
+    })
 }
 
 #[cfg(test)]

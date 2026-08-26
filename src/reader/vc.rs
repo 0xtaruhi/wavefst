@@ -13,7 +13,7 @@ use lz4_flex::block::decompress as lz4_decompress;
 
 use crate::block::{FrameSection, PackMarker, TimeSection, TimeTable, VcBlock};
 #[cfg(feature = "gzip")]
-use crate::compression::{zlib_decompress_into_with, zlib_decompress_with};
+use crate::compression::{with_decompressor, zlib_decompress_into_with, zlib_decompress_with};
 use crate::encoding::{decode_svarint, decode_varint_with_len};
 use crate::error::{Error, Result};
 use crate::types::{BlockType, FstByteOrder, PackType};
@@ -328,7 +328,7 @@ fn read_selected_chains<R: Read + Seek>(
     included_handles: &[u32],
     pack_type: PackType,
 ) -> Result<ChainStorage> {
-    let mut canonical_needed = vec![false; index.slots.len()];
+    let mut canonical_needed = Vec::with_capacity(included_handles.len());
     for &handle in included_handles {
         let handle_index = (handle - 1) as usize;
         let Some(slot) = index.slots.get(handle_index).and_then(Option::as_ref) else {
@@ -336,19 +336,17 @@ fn read_selected_chains<R: Read + Seek>(
         };
         let canonical = slot.alias_of.unwrap_or(handle);
         let canonical_index = (canonical - 1) as usize;
-        if canonical_index >= canonical_needed.len() {
+        if canonical_index >= index.slots.len() {
             return Err(Error::decode("dynamic alias target exceeds chain index"));
         }
-        canonical_needed[canonical_index] = true;
+        canonical_needed.push(canonical_index);
     }
+    canonical_needed.sort_unstable();
+    canonical_needed.dedup();
 
     let mut chain_buffer = Vec::new();
     let mut filtered_slots = vec![None; index.slots.len()];
-    let mut canonical_locations = vec![None; index.slots.len()];
-    for (handle_index, needed) in canonical_needed.into_iter().enumerate() {
-        if !needed {
-            continue;
-        }
+    for handle_index in canonical_needed {
         let slot = index.slots[handle_index]
             .as_ref()
             .ok_or_else(|| Error::decode("selected canonical handle has no chain slot"))?;
@@ -372,7 +370,6 @@ fn read_selected_chains<R: Read + Seek>(
             alias_of: None,
         };
         filtered_slots[handle_index] = Some(compact_slot);
-        canonical_locations[handle_index] = Some((compact_offset, slot.length));
     }
 
     for &handle in included_handles {
@@ -384,13 +381,13 @@ fn read_selected_chains<R: Read + Seek>(
             continue;
         };
         let canonical_index = (canonical - 1) as usize;
-        let (offset, length) = canonical_locations
+        let canonical_slot = filtered_slots
             .get(canonical_index)
-            .and_then(|location| *location)
+            .and_then(Option::as_ref)
             .ok_or_else(|| Error::decode("selected alias target has no loaded chain"))?;
         filtered_slots[handle_index] = Some(ChainSlot {
-            offset,
-            length,
+            offset: canonical_slot.offset,
+            length: canonical_slot.length,
             alias_of: Some(canonical),
         });
     }
@@ -499,39 +496,40 @@ fn build_chains(
     };
     #[cfg(feature = "gzip")]
     if direct_zlib {
-        let decoded_capacity = jobs.iter().try_fold(0_usize, |total, job| {
-            let len = usize::try_from(job.stored_len)
-                .map_err(|_| Error::decode("chain stored length exceeds addressable memory"))?;
-            total
-                .checked_add(len)
-                .ok_or_else(|| Error::decode("decoded chain arena length overflow"))
-        })?;
-        let mut decoded_arena = vec![0_u8; decoded_capacity];
-        let mut decoder = LibdeflateDecompressor::new();
-        let mut cursor = 0_usize;
-        for job in jobs {
-            let expected = usize::try_from(job.stored_len)
-                .map_err(|_| Error::decode("chain stored length exceeds addressable memory"))?;
-            let end = cursor
-                .checked_add(expected)
-                .ok_or_else(|| Error::decode("decoded chain range overflow"))?;
-            zlib_decompress_into_with(
-                &mut decoder,
-                job.compressed,
-                &mut decoded_arena[cursor..end],
-            )?;
-            let stored_len = u32::try_from(job.stored_len)
-                .map_err(|_| Error::decode("chain stored length exceeds u32 range"))?;
-            chains[job.handle_index] = Some(ChainData {
-                handle: (job.handle_index + 1) as u32,
-                stored_len,
-                payload: ChainPayload::Decoded { range: cursor..end },
-                alias_of: job.alias_of,
-            });
-            cursor = end;
-        }
-        resolve_chain_aliases(index, &mut chains)?;
-        return Ok((chains, decoded_arena));
+        return with_decompressor(|decoder| {
+            let decoded_capacity = jobs.iter().try_fold(0_usize, |total, job| {
+                let len = usize::try_from(job.stored_len)
+                    .map_err(|_| Error::decode("chain stored length exceeds addressable memory"))?;
+                total
+                    .checked_add(len)
+                    .ok_or_else(|| Error::decode("decoded chain arena length overflow"))
+            })?;
+            let mut decoded_arena = vec![0_u8; decoded_capacity];
+            let mut cursor = 0_usize;
+            for job in jobs {
+                let expected = usize::try_from(job.stored_len)
+                    .map_err(|_| Error::decode("chain stored length exceeds addressable memory"))?;
+                let end = cursor
+                    .checked_add(expected)
+                    .ok_or_else(|| Error::decode("decoded chain range overflow"))?;
+                zlib_decompress_into_with(
+                    decoder,
+                    job.compressed,
+                    &mut decoded_arena[cursor..end],
+                )?;
+                let stored_len = u32::try_from(job.stored_len)
+                    .map_err(|_| Error::decode("chain stored length exceeds u32 range"))?;
+                chains[job.handle_index] = Some(ChainData {
+                    handle: (job.handle_index + 1) as u32,
+                    stored_len,
+                    payload: ChainPayload::Decoded { range: cursor..end },
+                    alias_of: job.alias_of,
+                });
+                cursor = end;
+            }
+            resolve_chain_aliases(index, &mut chains)?;
+            Ok((chains, decoded_arena))
+        });
     }
 
     let finish_job = |job: ChainJob<'_>, data: Vec<u8>| -> Result<ChainJobResult> {
@@ -745,15 +743,14 @@ fn decode_chain_index<R: Read + Seek>(
     let mut bytes = vec![0u8; index_len_usize];
     reader.read_exact(&mut bytes)?;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Copy)]
     enum EntryTmp {
         Empty,
-        Data { offset: u64 },
+        Data { offset: u64, length: Option<u32> },
         Alias { target: usize },
     }
 
     let mut entries: Vec<EntryTmp> = Vec::with_capacity(max_handle_hint);
-    let mut has_payload: Vec<bool> = Vec::with_capacity(max_handle_hint);
     let mut slice = bytes.as_slice();
     let mut last_offset = 0u64;
     let mut last_alias_target: Option<usize> = None;
@@ -774,8 +771,8 @@ fn decode_chain_index<R: Read + Seek>(
                     .ok_or_else(|| Error::decode("chain index overflow"))?;
                 entries.push(EntryTmp::Data {
                     offset: last_offset,
+                    length: None,
                 });
-                has_payload.push(true);
                 last_alias_target = None;
             } else if shval < 0 {
                 if entries.len() >= max_handle_hint {
@@ -787,20 +784,17 @@ fn decode_chain_index<R: Read + Seek>(
                 let target = usize::try_from(target)
                     .map_err(|_| Error::decode("alias target exceeds addressable range"))?;
                 entries.push(EntryTmp::Alias { target });
-                has_payload.push(false);
                 last_alias_target = Some(target);
             } else if let Some(target) = last_alias_target {
                 if entries.len() >= max_handle_hint {
                     return Err(Error::decode("chain index contains too many handles"));
                 }
                 entries.push(EntryTmp::Alias { target });
-                has_payload.push(false);
             } else {
                 if entries.len() >= max_handle_hint {
                     return Err(Error::decode("chain index contains too many handles"));
                 }
                 entries.push(EntryTmp::Empty);
-                has_payload.push(false);
             }
             continue;
         }
@@ -816,7 +810,6 @@ fn decode_chain_index<R: Read + Seek>(
                     return Err(Error::decode("chain index contains too many handles"));
                 }
                 entries.push(EntryTmp::Empty);
-                has_payload.push(false);
                 last_alias_target = None;
             } else {
                 if entries.len() >= max_handle_hint {
@@ -828,7 +821,6 @@ fn decode_chain_index<R: Read + Seek>(
                 let target = usize::try_from(target)
                     .map_err(|_| Error::decode("alias target exceeds addressable range"))?;
                 entries.push(EntryTmp::Alias { target });
-                has_payload.push(false);
                 last_alias_target = Some(target);
             }
             continue;
@@ -842,7 +834,6 @@ fn decode_chain_index<R: Read + Seek>(
                 return Err(Error::decode("invalid empty run in chain index"));
             }
             entries.extend((0..repeat).map(|_| EntryTmp::Empty));
-            has_payload.resize(has_payload.len() + repeat, false);
             continue;
         }
 
@@ -855,8 +846,8 @@ fn decode_chain_index<R: Read + Seek>(
             .ok_or_else(|| Error::decode("chain index overflow"))?;
         entries.push(EntryTmp::Data {
             offset: last_offset,
+            length: None,
         });
-        has_payload.push(true);
         last_alias_target = None;
     }
 
@@ -871,106 +862,104 @@ fn decode_chain_index<R: Read + Seek>(
         .checked_sub(chain_start)
         .ok_or_else(|| Error::invalid("negative chain range"))?;
 
-    let mut offsets = Vec::<Option<u64>>::with_capacity(entries.len());
-    let mut lengths = Vec::<Option<u32>>::with_capacity(entries.len());
-    let mut alias_targets = Vec::<Option<usize>>::with_capacity(entries.len());
-
-    for entry in &entries {
-        match entry {
-            EntryTmp::Empty => {
-                offsets.push(None);
-                lengths.push(None);
-                alias_targets.push(None);
+    const PACK_MARKER_PREFIX: u64 = 1;
+    let has_aliases = entries
+        .iter()
+        .any(|entry| matches!(entry, EntryTmp::Alias { .. }));
+    if !has_aliases {
+        let mut slots: Vec<Option<ChainSlot>> = Vec::with_capacity(entries.len());
+        let mut previous_data: Option<(usize, u64)> = None;
+        for entry in entries {
+            let EntryTmp::Data { offset, .. } = entry else {
+                slots.push(None);
+                continue;
+            };
+            let offset = offset
+                .checked_sub(PACK_MARKER_PREFIX)
+                .ok_or_else(|| Error::decode("chain offset precedes pack marker"))?;
+            if offset > total_chain_len {
+                return Err(Error::decode("chain offset exceeds chain payload bounds"));
             }
-            EntryTmp::Data { offset } => {
-                offsets.push(Some(*offset));
-                lengths.push(None);
-                alias_targets.push(None);
+            if let Some((previous_idx, previous_offset)) = previous_data {
+                let span = offset
+                    .checked_sub(previous_offset)
+                    .ok_or_else(|| Error::decode("chain offsets are not monotonic"))?;
+                slots[previous_idx]
+                    .as_mut()
+                    .expect("previous data slot must exist")
+                    .length = u32::try_from(span)
+                    .map_err(|_| Error::decode("chain payload exceeds u32 range"))?;
             }
-            EntryTmp::Alias { target } => {
-                offsets.push(None);
-                lengths.push(None);
-                alias_targets.push(Some(*target));
-            }
+            let absolute = chain_start
+                .checked_add(offset)
+                .ok_or_else(|| Error::invalid("chain offset overflow"))?;
+            previous_data = Some((slots.len(), offset));
+            slots.push(Some(ChainSlot {
+                offset: absolute,
+                length: 0,
+                alias_of: None,
+            }));
         }
+        if let Some((last_idx, last_offset)) = previous_data {
+            let span = total_chain_len
+                .checked_sub(last_offset)
+                .ok_or_else(|| Error::decode("chain offset exceeds payload bounds"))?;
+            slots[last_idx]
+                .as_mut()
+                .expect("last data slot must exist")
+                .length = u32::try_from(span)
+                .map_err(|_| Error::decode("chain payload exceeds u32 range"))?;
+        }
+        return Ok(ChainIndex { slots });
     }
 
-    const PACK_MARKER_PREFIX: u64 = 1;
-    for off in offsets.iter_mut().flatten() {
-        if *off < PACK_MARKER_PREFIX {
+    for entry in &mut entries {
+        let EntryTmp::Data { offset, .. } = entry else {
+            continue;
+        };
+        if *offset < PACK_MARKER_PREFIX {
             return Err(Error::decode("chain offset precedes pack marker"));
         }
-        *off -= PACK_MARKER_PREFIX;
-        if *off > total_chain_len {
+        *offset -= PACK_MARKER_PREFIX;
+        if *offset > total_chain_len {
             return Err(Error::decode("chain offset exceeds chain payload bounds"));
         }
     }
 
-    let mut prev_data_idx: Option<usize> = None;
-    for idx in 0..offsets.len() {
-        if let Some(off) = offsets[idx] {
-            if let Some(prev) = prev_data_idx
-                && let Some(prev_off) = offsets[prev]
+    let mut previous_data: Option<(usize, u64)> = None;
+    for idx in 0..entries.len() {
+        let offset = match entries[idx] {
+            EntryTmp::Data { offset, .. } => offset,
+            EntryTmp::Empty | EntryTmp::Alias { .. } => continue,
+        };
+        if let Some((previous_idx, previous_offset)) = previous_data {
+            let span = offset
+                .checked_sub(previous_offset)
+                .ok_or_else(|| Error::decode("chain offsets are not monotonic"))?;
+            let length = u32::try_from(span)
+                .map_err(|_| Error::decode("chain payload exceeds u32 range"))?;
+            if let EntryTmp::Data {
+                length: previous_length,
+                ..
+            } = &mut entries[previous_idx]
             {
-                let span = off
-                    .checked_sub(prev_off)
-                    .ok_or_else(|| Error::decode("chain offsets are not monotonic"))?;
-                lengths[prev] = Some(
-                    u32::try_from(span)
-                        .map_err(|_| Error::decode("chain payload exceeds u32 range"))?,
-                );
+                *previous_length = Some(length);
             }
-            prev_data_idx = Some(idx);
         }
+        previous_data = Some((idx, offset));
     }
-    if let Some(last_idx) = prev_data_idx
-        && let Some(last_off) = offsets[last_idx]
-    {
+    if let Some((last_idx, last_offset)) = previous_data {
         let span = total_chain_len
-            .checked_sub(last_off)
+            .checked_sub(last_offset)
             .ok_or_else(|| Error::decode("chain offset exceeds payload bounds"))?;
-        lengths[last_idx] = Some(
-            u32::try_from(span).map_err(|_| Error::decode("chain payload exceeds u32 range"))?,
-        );
-    }
-
-    fn resolve(
-        idx: usize,
-        offsets: &mut [Option<u64>],
-        lengths: &mut [Option<u32>],
-        alias_targets: &[Option<usize>],
-        visiting: &mut [bool],
-    ) -> Option<(u64, u32)> {
-        if let (Some(off), Some(len)) = (offsets[idx], lengths[idx]) {
-            return Some((off, len));
-        }
-        if visiting[idx] {
-            return None;
-        }
-        visiting[idx] = true;
-        if let Some(target) = alias_targets[idx]
-            && target < offsets.len()
-            && let Some((off, len)) = resolve(target, offsets, lengths, alias_targets, visiting)
+        let length =
+            u32::try_from(span).map_err(|_| Error::decode("chain payload exceeds u32 range"))?;
+        if let EntryTmp::Data {
+            length: last_length,
+            ..
+        } = &mut entries[last_idx]
         {
-            offsets[idx] = Some(off);
-            lengths[idx] = Some(len);
-            visiting[idx] = false;
-            return Some((off, len));
-        }
-        visiting[idx] = false;
-        None
-    }
-
-    let mut visiting = vec![false; offsets.len()];
-    for idx in 0..offsets.len() {
-        if offsets[idx].is_none() {
-            let _ = resolve(
-                idx,
-                &mut offsets,
-                &mut lengths,
-                &alias_targets,
-                &mut visiting,
-            );
+            *last_length = Some(length);
         }
     }
 
@@ -983,8 +972,7 @@ fn decode_chain_index<R: Read + Seek>(
 
     fn resolve_canonical(
         idx: usize,
-        alias_targets: &[Option<usize>],
-        has_payload: &[bool],
+        entries: &[EntryTmp],
         memo: &mut [CanonicalResolution],
         visiting: &mut [bool],
     ) -> Option<usize> {
@@ -998,60 +986,70 @@ fn decode_chain_index<R: Read + Seek>(
             return None;
         }
         visiting[idx] = true;
-        let result = if has_payload[idx] {
-            Some(idx)
-        } else if let Some(target) = alias_targets[idx] {
-            if target < alias_targets.len() {
-                resolve_canonical(target, alias_targets, has_payload, memo, visiting)
-            } else {
-                None
+        let result = match entries[idx] {
+            EntryTmp::Data { .. } => Some(idx),
+            EntryTmp::Alias { target } if target < entries.len() => {
+                resolve_canonical(target, entries, memo, visiting)
             }
-        } else {
-            None
+            EntryTmp::Empty | EntryTmp::Alias { .. } => None,
         };
         visiting[idx] = false;
         memo[idx] = result.map_or(CanonicalResolution::Missing, CanonicalResolution::Found);
         result
     }
 
-    let mut canonical_memo = vec![CanonicalResolution::Unknown; alias_targets.len()];
-    let mut canonical_visiting = vec![false; alias_targets.len()];
-    let mut canonical = Vec::with_capacity(alias_targets.len());
-    for idx in 0..alias_targets.len() {
-        let resolved = resolve_canonical(
-            idx,
-            &alias_targets,
-            &has_payload,
-            &mut canonical_memo,
-            &mut canonical_visiting,
-        );
-        canonical.push(resolved);
+    let mut canonical = Vec::new();
+    if has_aliases {
+        canonical.resize(entries.len(), CanonicalResolution::Unknown);
+        let mut visiting = vec![false; entries.len()];
+        for idx in 0..entries.len() {
+            if matches!(entries[idx], EntryTmp::Alias { .. }) {
+                let _ = resolve_canonical(idx, &entries, &mut canonical, &mut visiting);
+            }
+        }
     }
 
-    let mut slots = Vec::with_capacity(offsets.len());
-    for idx in 0..offsets.len() {
-        match (offsets[idx], lengths[idx]) {
-            (Some(off), Some(len)) => {
+    let mut slots = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        match *entry {
+            EntryTmp::Data {
+                offset,
+                length: Some(length),
+            } => {
                 let absolute = chain_start
-                    .checked_add(off)
+                    .checked_add(offset)
                     .ok_or_else(|| Error::invalid("chain offset overflow"))?;
-                let alias_handle = if has_payload[idx] {
-                    None
-                } else if let Some(canon_idx) = canonical[idx] {
-                    Some(
-                        u32::try_from(canon_idx + 1)
-                            .map_err(|_| Error::invalid("alias target exceeds u32 range"))?,
-                    )
-                } else {
-                    None
-                };
                 slots.push(Some(ChainSlot {
                     offset: absolute,
-                    length: len,
-                    alias_of: alias_handle,
+                    length,
+                    alias_of: None,
                 }));
             }
-            _ => slots.push(None),
+            EntryTmp::Alias { .. } => {
+                let CanonicalResolution::Found(canonical_idx) = canonical[idx] else {
+                    slots.push(None);
+                    continue;
+                };
+                let EntryTmp::Data {
+                    offset,
+                    length: Some(length),
+                } = entries[canonical_idx]
+                else {
+                    slots.push(None);
+                    continue;
+                };
+                let absolute = chain_start
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::invalid("chain offset overflow"))?;
+                let alias_of = u32::try_from(canonical_idx + 1)
+                    .map_err(|_| Error::invalid("alias target exceeds u32 range"))?;
+                slots.push(Some(ChainSlot {
+                    offset: absolute,
+                    length,
+                    alias_of: Some(alias_of),
+                }));
+            }
+            EntryTmp::Empty | EntryTmp::Data { length: None, .. } => slots.push(None),
         }
     }
 

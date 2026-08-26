@@ -23,6 +23,8 @@ pub use change::{ValueChange, VcBlockChanges, build_changes};
 pub struct ReaderOptions {
     /// When `true`, geometry blocks are loaded eagerly as soon as they appear.
     pub eager_geometry: bool,
+    /// When `true`, hierarchy blocks are decompressed and parsed.
+    pub load_hierarchy: bool,
     /// Maximum accepted uncompressed size for a whole-file gzip wrapper.
     pub max_decompressed_bytes: u64,
     /// Maximum accepted compressed or decoded size for an individual FST block.
@@ -40,6 +42,7 @@ impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
             eager_geometry: true,
+            load_hierarchy: true,
             max_decompressed_bytes: 8 * 1024 * 1024 * 1024,
             max_block_bytes: 4 * 1024 * 1024 * 1024,
             max_handles: 16_777_216,
@@ -74,6 +77,16 @@ impl<R: ReadSeek> ReaderBuilder<R> {
     /// Enables or disables eager geometry parsing.
     pub fn eager_geometry(mut self, value: bool) -> Self {
         self.options.eager_geometry = value;
+        self
+    }
+
+    /// Enables or disables hierarchy decoding.
+    ///
+    /// Disabling it reduces fixed open cost when handles are already known and only value changes
+    /// are needed. Geometry remains available for decoding values, while [`FstReader::hierarchy`]
+    /// returns `None`.
+    pub fn load_hierarchy(mut self, value: bool) -> Self {
+        self.options.load_hierarchy = value;
         self
     }
 
@@ -439,11 +452,15 @@ impl<R: ReadSeek> FstReader<R> {
                 Ok(true)
             }
             BlockType::Hierarchy | BlockType::HierarchyLz4 | BlockType::HierarchyLz4Duo => {
-                self.hierarchy = Some(Self::read_hierarchy_block(
-                    reader,
-                    block_type,
-                    self.options.max_block_bytes,
-                )?);
+                if self.options.load_hierarchy {
+                    self.hierarchy = Some(Self::read_hierarchy_block(
+                        reader,
+                        block_type,
+                        self.options.max_block_bytes,
+                    )?);
+                } else {
+                    Self::skip_hierarchy_block(reader, self.options.max_block_bytes)?;
+                }
                 Ok(true)
             }
             BlockType::Skip => {
@@ -494,6 +511,23 @@ impl<R: ReadSeek> FstReader<R> {
         }
         reader.seek(SeekFrom::Current(-8))?;
         HierarchyBlock::decode_block(reader, block_type, section_length)
+    }
+
+    fn skip_hierarchy_block<Rd: Read + Seek>(reader: &mut Rd, max_block_bytes: u64) -> Result<()> {
+        let section_length = read_u64_be(reader)?;
+        validate_block_size(section_length, max_block_bytes)?;
+        if section_length < 16 {
+            return Err(Error::invalid(
+                "hierarchy section shorter than required metadata",
+            ));
+        }
+        let uncompressed_len = read_u64_be(reader)?;
+        if uncompressed_len > max_block_bytes {
+            return Err(Error::invalid(
+                "decoded hierarchy exceeds configured block limit",
+            ));
+        }
+        skip_bytes(reader, section_length - 16)
     }
 }
 

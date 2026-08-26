@@ -319,6 +319,30 @@ fn empty_and_invalid_handle_selections_are_well_defined() -> wavefst::Result<()>
     Ok(())
 }
 
+#[test]
+fn hierarchy_can_be_skipped_when_handles_are_already_known() -> wavefst::Result<()> {
+    let bytes = write_binary_trace(4, 16, usize::MAX, ChainCompression::Raw)?;
+
+    let default_reader = ReaderBuilder::new(Cursor::new(&bytes)).build()?;
+    assert!(default_reader.hierarchy().is_some());
+
+    let mut reader = ReaderBuilder::new(Cursor::new(&bytes))
+        .include_handles([3])
+        .load_hierarchy(false)
+        .build()?;
+    assert!(reader.hierarchy().is_none());
+    assert!(reader.geometry().is_some());
+    let mut count = 0;
+    while let Some(changes) = reader.next_value_changes()? {
+        count = changes.try_fold_binary(count, |count, _, handle, _, _| {
+            assert_eq!(handle, 3);
+            count + 1
+        })?;
+    }
+    assert_eq!(count, 16);
+    Ok(())
+}
+
 #[cfg(all(feature = "gzip", feature = "lz4"))]
 #[test]
 fn filtered_libfst_fixture_matches_post_filtering_the_full_stream() -> wavefst::Result<()> {

@@ -1,0 +1,14 @@
+[package]
+name = "wavefst-ecosystem-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+wavefst = { path = "../..", default-features = false, features = ["gzip", "lz4"] }
+wellen = "=0.25.6"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

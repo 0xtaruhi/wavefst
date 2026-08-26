@@ -15,6 +15,7 @@ use wavefst::{
 const SIGNALS: usize = 512;
 const STEPS: usize = 128;
 const EXPECTED_EVENTS: usize = SIGNALS * STEPS;
+const EXPECTED_SELECTED_EVENTS: usize = STEPS;
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -22,12 +23,16 @@ fn main() -> Result<()> {
     let path = args.next().unwrap_or_default();
     let iterations = parse_count(args.next(), "iterations")?;
     let warmup = parse_count(args.next(), "warmup")?;
-    if args.next().is_some() || path.is_empty() || !matches!(mode.as_str(), "read" | "write") {
-        bail!("usage: libfst_bench <read|write> <path> <iterations> <warmup>");
+    if args.next().is_some()
+        || path.is_empty()
+        || !matches!(mode.as_str(), "read" | "read-one" | "write")
+    {
+        bail!("usage: libfst_bench <read|read-one|write> <path> <iterations> <warmup>");
     }
 
     let operation: fn(&Path) -> Result<usize> = match mode.as_str() {
         "read" => read_trace,
+        "read-one" => read_trace_selected,
         "write" => write_trace,
         _ => unreachable!(),
     };
@@ -106,6 +111,24 @@ fn read_trace(path: &Path) -> Result<usize> {
     }
     if count != EXPECTED_EVENTS {
         bail!("benchmark expected {EXPECTED_EVENTS} events, decoded {count}");
+    }
+    Ok(count)
+}
+
+fn read_trace_selected(path: &Path) -> Result<usize> {
+    let mut reader = ReaderBuilder::new(File::open(path)?)
+        .include_handles([1])
+        .load_hierarchy(false)
+        .build()?;
+    let mut count = 0usize;
+    while let Some(changes) = reader.next_value_changes()? {
+        count = changes.try_fold_binary(count, |count, time, handle, alias, value| {
+            black_box((time, handle, alias, value));
+            count + 1
+        })?;
+    }
+    if count != EXPECTED_SELECTED_EVENTS {
+        bail!("benchmark expected {EXPECTED_SELECTED_EVENTS} selected events, decoded {count}");
     }
     Ok(count)
 }

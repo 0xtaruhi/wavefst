@@ -12,6 +12,7 @@
 #define SIGNALS 512u
 #define STEPS 128u
 #define EXPECTED_EVENTS ((uint64_t)SIGNALS * STEPS)
+#define EXPECTED_SELECTED_EVENTS ((uint64_t)STEPS)
 
 static void fail(const char *message)
 {
@@ -97,6 +98,26 @@ static uint64_t read_trace(const char *path)
     return count;
 }
 
+static uint64_t read_trace_selected(const char *path)
+{
+    fstReaderContext *reader = fstReaderOpen(path);
+    uint64_t count = 0;
+    if (!reader)
+        fail("fstReaderOpen failed");
+    fstReaderSetFacProcessMask(reader, 1);
+    if (!fstReaderIterBlocks(reader, count_change, &count, NULL))
+        fail("fstReaderIterBlocks failed");
+    fstReaderClose(reader);
+    if (count != EXPECTED_SELECTED_EVENTS) {
+        fprintf(stderr,
+                "libfst_bench: expected %" PRIu64 " selected events, decoded %" PRIu64 "\n",
+                EXPECTED_SELECTED_EVENTS,
+                count);
+        exit(1);
+    }
+    return count;
+}
+
 static unsigned parse_count(const char *text, const char *name, int allow_zero)
 {
     char *end = NULL;
@@ -118,9 +139,11 @@ int main(int argc, char **argv)
     unsigned warmup;
     unsigned index;
 
-    if (argc != 5 || (strcmp(argv[1], "read") && strcmp(argv[1], "write")))
-        fail("usage: libfst_bench <read|write> <path> <iterations> <warmup>");
-    operation = !strcmp(argv[1], "read") ? read_trace : write_trace;
+    if (argc != 5 || (strcmp(argv[1], "read") && strcmp(argv[1], "read-one") && strcmp(argv[1], "write")))
+        fail("usage: libfst_bench <read|read-one|write> <path> <iterations> <warmup>");
+    operation = !strcmp(argv[1], "read") ? read_trace
+              : !strcmp(argv[1], "read-one") ? read_trace_selected
+                                               : write_trace;
     iterations = parse_count(argv[3], "iterations", 0);
     warmup = parse_count(argv[4], "warmup", 1);
 

@@ -12,6 +12,12 @@ c_trace="$bench_dir/libfst.fst"
 cpu=${BENCH_CPU:-12}
 iterations=${ITERATIONS:-100}
 warmup=${WARMUP:-10}
+samples=${SAMPLES:-5}
+
+if ((samples == 0 || samples % 2 == 0)); then
+    echo "SAMPLES must be a positive odd integer" >&2
+    exit 1
+fi
 
 if [[ ! -f "$libfst_source/src/fstapi.c" ]]; then
     git clone --quiet https://github.com/gtkwave/libfst.git "$libfst_source"
@@ -37,12 +43,25 @@ run_pinned() {
     taskset -c "$cpu" "$@"
 }
 
-rust_write=$(run_pinned "$rust_bin" write "$rust_trace" "$iterations" "$warmup")
-libfst_write=$(run_pinned "$c_bin" write "$c_trace" "$iterations" "$warmup")
-rust_read_rust=$(run_pinned "$rust_bin" read "$rust_trace" "$iterations" "$warmup")
-libfst_read_rust=$(run_pinned "$c_bin" read "$rust_trace" "$iterations" "$warmup")
-rust_read_libfst=$(run_pinned "$rust_bin" read "$c_trace" "$iterations" "$warmup")
-libfst_read_libfst=$(run_pinned "$c_bin" read "$c_trace" "$iterations" "$warmup")
+median_pinned() {
+    local values=()
+    local sample
+    for ((sample = 0; sample < samples; ++sample)); do
+        values+=("$(run_pinned "$@")")
+    done
+    printf '%s\n' "${values[@]}" | sort -n | sed -n "$((samples / 2 + 1))p"
+}
+
+rust_write=$(median_pinned "$rust_bin" write "$rust_trace" "$iterations" "$warmup")
+libfst_write=$(median_pinned "$c_bin" write "$c_trace" "$iterations" "$warmup")
+rust_read_rust=$(median_pinned "$rust_bin" read "$rust_trace" "$iterations" "$warmup")
+libfst_read_rust=$(median_pinned "$c_bin" read "$rust_trace" "$iterations" "$warmup")
+rust_read_libfst=$(median_pinned "$rust_bin" read "$c_trace" "$iterations" "$warmup")
+libfst_read_libfst=$(median_pinned "$c_bin" read "$c_trace" "$iterations" "$warmup")
+rust_read_one_rust=$(median_pinned "$rust_bin" read-one "$rust_trace" "$iterations" "$warmup")
+libfst_read_one_rust=$(median_pinned "$c_bin" read-one "$rust_trace" "$iterations" "$warmup")
+rust_read_one_libfst=$(median_pinned "$rust_bin" read-one "$c_trace" "$iterations" "$warmup")
+libfst_read_one_libfst=$(median_pinned "$c_bin" read-one "$c_trace" "$iterations" "$warmup")
 
 echo "implementation,operation,input,ns_per_iteration,file_bytes,events"
 echo "wavefst,write,wavefst,$rust_write,$(stat -c %s "$rust_trace"),65536"
@@ -51,3 +70,7 @@ echo "wavefst,read,wavefst,$rust_read_rust,$(stat -c %s "$rust_trace"),65536"
 echo "libfst,read,wavefst,$libfst_read_rust,$(stat -c %s "$rust_trace"),65536"
 echo "wavefst,read,libfst,$rust_read_libfst,$(stat -c %s "$c_trace"),65536"
 echo "libfst,read,libfst,$libfst_read_libfst,$(stat -c %s "$c_trace"),65536"
+echo "wavefst,read-one,wavefst,$rust_read_one_rust,$(stat -c %s "$rust_trace"),128"
+echo "libfst,read-one,wavefst,$libfst_read_one_rust,$(stat -c %s "$rust_trace"),128"
+echo "wavefst,read-one,libfst,$rust_read_one_libfst,$(stat -c %s "$c_trace"),128"
+echo "libfst,read-one,libfst,$libfst_read_one_libfst,$(stat -c %s "$c_trace"),128"

@@ -167,6 +167,7 @@ fn fold_dense_binary_selected(
     let mut reader = ReaderBuilder::new(Cursor::new(data))
         .include_handles(handles)
         .time_range(time_range)
+        .load_hierarchy(false)
         .build()
         .unwrap();
     let mut count = 0usize;

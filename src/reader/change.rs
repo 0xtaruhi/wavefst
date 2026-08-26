@@ -14,6 +14,11 @@ use crate::types::{FstByteOrder, SignalValue};
 const FST_RCV_STR: [char; 8] = ['x', 'z', 'h', 'u', 'w', 'l', '-', '?'];
 const NO_CURSOR: usize = usize::MAX;
 
+#[inline]
+fn aliases_for(alias_map: &[Vec<u32>], handle: u32) -> &[u32] {
+    alias_map.get(handle as usize).map_or(&[], Vec::as_slice)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SignalKind {
     Bit,
@@ -370,7 +375,7 @@ impl<'a> VcBlockChanges<'a> {
             }
         }
 
-        let mut alias_map = vec![Vec::new(); alias_index.slots.len() + 1];
+        let mut alias_map = Vec::new();
         for (slot_idx, slot_opt) in alias_index.slots.iter().enumerate() {
             let Some(slot) = slot_opt else {
                 continue;
@@ -378,6 +383,9 @@ impl<'a> VcBlockChanges<'a> {
             if let Some(canon) = slot.alias_of {
                 let alias = (slot_idx + 1) as u32;
                 if included_handles.is_none_or(|handles| handles.binary_search(&alias).is_ok()) {
+                    if alias_map.is_empty() {
+                        alias_map.resize_with(alias_index.slots.len() + 1, Vec::new);
+                    }
                     alias_map[canon as usize].push(alias);
                 }
             }
@@ -429,7 +437,7 @@ impl<'a> VcBlockChanges<'a> {
             }
 
             let handle = cursor.handle;
-            let aliases = &self.alias_map[handle as usize];
+            let aliases = aliases_for(&self.alias_map, handle);
             if cursor.emit_canonical && aliases.is_empty() {
                 visitor(ValueChange {
                     timestamp,
@@ -514,7 +522,7 @@ impl<'a> VcBlockChanges<'a> {
                 }
 
                 let handle = cursor.handle;
-                let aliases = &self.alias_map[handle as usize];
+                let aliases = aliases_for(&self.alias_map, handle);
                 if cursor.emit_canonical && aliases.is_empty() {
                     accumulator = fold(accumulator, timestamp, handle, None, value);
                 } else {
@@ -589,7 +597,7 @@ impl<'a> VcBlockChanges<'a> {
                 }
 
                 let handle = cursor.handle;
-                let aliases = &self.alias_map[handle as usize];
+                let aliases = aliases_for(&self.alias_map, handle);
                 if cursor.emit_canonical {
                     accumulator = fold(accumulator, timestamp, handle, None, value);
                 }
@@ -617,7 +625,7 @@ impl<'a> VcBlockChanges<'a> {
     {
         for mut cursor in self.cursors {
             let handle = cursor.handle;
-            let aliases = &self.alias_map[handle as usize];
+            let aliases = aliases_for(&self.alias_map, handle);
             while let Some(delta) = cursor.peek_delta()? {
                 let time_index = cursor
                     .current_time_index
@@ -667,7 +675,7 @@ impl<'a> VcBlockChanges<'a> {
             .into_par_iter()
             .try_for_each(|mut cursor| -> Result<()> {
                 let handle = cursor.handle;
-                let handle_aliases = &aliases[handle as usize];
+                let handle_aliases = aliases_for(aliases, handle);
                 while let Some(delta) = cursor.peek_delta()? {
                     let time_index = cursor
                         .current_time_index
@@ -724,7 +732,7 @@ impl<'a> VcBlockChanges<'a> {
             .map(|mut cursor| -> Result<T> {
                 let mut accumulator = init_ref();
                 let handle = cursor.handle;
-                let handle_aliases = &aliases[handle as usize];
+                let handle_aliases = aliases_for(aliases, handle);
                 while let Some(delta) = cursor.peek_delta()? {
                     let time_index = cursor
                         .current_time_index

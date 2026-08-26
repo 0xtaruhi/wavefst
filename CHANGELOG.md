@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Replaced the former commercial-use restriction with the standard MIT License and declared the
+  package using the SPDX `MIT` identifier.
+- Expanded reproducible performance coverage and README results across dense, wide, long, full,
+  selective, hierarchy-open, batch, and scalar scenarios against libfst, Wellen, and libfstwriter.
+- Reduced reader fixed costs with buffered in-memory backtracking, optional hierarchy loading,
+  reusable thread-local libdeflate decoders, compact selected-chain staging, and an alias-free
+  chain-index fast path.
+
 ## 0.2.2 - 2026-08-26
 
 ### Added

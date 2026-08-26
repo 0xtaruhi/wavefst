@@ -89,7 +89,9 @@ fn read_window(path: &str) -> wavefst::Result<()> {
 Handles are one-based. The time range is inclusive. The reader still decodes the compact chain
 index and the relevant time tables, but reads and decompresses only selected chain payloads;
 value-change blocks wholly outside the requested range are seek-skipped. Omitting both filters uses
-the original contiguous full-scan path.
+the original contiguous full-scan path. If handles are already known and signal names are not
+needed, add `.load_hierarchy(false)` to skip hierarchy decompression and parsing while retaining the
+geometry required to decode values.
 
 For handle-major analysis that does not require global timestamp ordering, use
 `try_for_each_parts_unordered`. With the default `parallel` feature, reductions can avoid shared
@@ -160,37 +162,97 @@ cargo add wavefst --no-default-features --features "gzip parallel"
 ## Performance
 
 Criterion benchmarks cover full trace creation and full value-change traversal for raw, zlib, LZ4,
-and optional FastLZ configurations. Run them on the target machine with:
+and optional FastLZ configurations:
 
 ```bash
 cargo bench
 ```
 
-### Comparison with libfst
+The cross-tool numbers below were measured on an Intel Xeon Gold 6148 with one process pinned to
+CPU 12, Rust 1.98.0, and GCC 15.2.0. They are medians of five samples after warmup; every iteration
+opens or creates the file and validates the resulting item count. Lower latency is better. The
+comparison pins [Wellen](https://github.com/ekiwi/wellen) 0.25.6,
+[libfst](https://github.com/gtkwave/libfst) at `cf74bef`, and
+[libfstwriter](https://github.com/gtkwave/libfstwriter) at `6397a1e`. Absolute times depend on CPU,
+filesystem cache, compiler, and waveform shape, so the scripts—not these numbers—are authoritative.
 
-The repository also contains a cross-implementation benchmark using the pinned upstream libfst
-revision from the interoperability oracle. Both writers receive the same deterministic trace of
-512 one-bit signals over 128 timestamps (65,536 events). Both use zlib level 4 for value chains and
-level 9 for time tables; every read verifies the exact event count. Each reader is measured on both
-implementations' output so input layout cannot determine the result by itself.
+### Rust reader comparison: Wellen
 
-These are the medians of three runs with 50 warmups and 500 measured iterations, pinned to one CPU
-on an Intel Xeon Gold 6148 (Rust 1.98.0, GCC 15.2.0). Lower latency is better.
+These traces use zlib chains and contain deterministic one-bit values. `all` streams every change,
+`one` streams only the first signal through each library's native filter, and `open` parses enough
+metadata to count signals. Both readers are configured for a single thread.
 
-| Operation and input | wavefst | libfst | wavefst relative |
-|---------------------|--------:|-------:|-----------------:|
-| Write implementation's own FST | 6.79 ms | 10.24 ms | 1.51× faster |
-| Read wavefst output | 2.27 ms | 2.76 ms | 1.21× faster |
-| Read libfst output | 2.16 ms | 2.68 ms | 1.24× faster |
+| Shape | Operation | Items | wavefst | Wellen | wavefst relative |
+|-------|-----------|------:|--------:|-------:|-----------------:|
+| Dense: 512 × 128 | all | 65,536 | 2.01 ms | 13.77 ms | 6.83× faster |
+| Dense: 512 × 128 | one | 128 | 0.112 ms | 0.379 ms | 3.39× faster |
+| Dense: 512 × 128 | open | 512 | 0.095 ms | 0.305 ms | 3.23× faster |
+| Wide: 8,192 × 256 | all | 2,097,152 | 60.38 ms | 319.26 ms | 5.29× faster |
+| Wide: 8,192 × 256 | one | 256 | 2.38 ms | 4.12 ms | 1.73× faster |
+| Wide: 8,192 × 256 | open | 8,192 | 1.21 ms | 3.88 ms | 3.21× faster |
+| Long: 32 × 65,536 | all | 2,097,152 | 39.01 ms | 179.91 ms | 4.61× faster |
+| Long: 32 × 65,536 | one | 65,536 | 2.05 ms | 8.31 ms | 4.06× faster |
+| Long: 32 × 65,536 | open | 32 | 0.079 ms | 1.09 ms | 13.81× faster |
 
-The resulting files were 29,333 bytes for wavefst and 29,651 bytes for libfst. The wavefst writer
-uses its public `emit_binary_batch` hot path; libfst has no equivalent batch call and uses
-`fstWriterEmitValueChange`. This is one dense binary workload, not a universal performance claim.
-Run the exact harness on the target machine with:
+The generated files are 29,333 bytes (dense), 683,480 bytes (wide), and 342,899 bytes (long).
+Reproduce the table with:
 
 ```bash
-ITERATIONS=500 WARMUP=50 BENCH_CPU=12 scripts/bench-libfst.sh
+BENCH_CPU=12 SAMPLES=5 scripts/bench-wellen.sh
 ```
+
+### Reference reader and writer: libfst
+
+The bidirectional libfst harness uses 512 signals × 128 timestamps, zlib value chains, and both
+implementations' output. This exposes format-dependent results instead of benchmarking each reader
+only on its preferred layout.
+
+| Operation | Input | wavefst | libfst | Result |
+|-----------|-------|--------:|-------:|--------|
+| Full read | wavefst FST | 2.29 ms | 2.75 ms | wavefst 1.20× faster |
+| Full read | libfst FST | 2.19 ms | 2.67 ms | wavefst 1.22× faster |
+| One signal | wavefst FST | 0.059 ms | 0.088 ms | wavefst 1.49× faster |
+| One signal | libfst FST | 0.060 ms | 0.074 ms | wavefst 1.24× faster |
+| Write own FST | own output | 6.66 ms | 9.48 ms | wavefst 1.42× faster |
+
+wavefst output is 29,333 bytes and libfst output is 29,651 bytes. The one-signal wavefst rows use
+`include_handles([1]).load_hierarchy(false)`, matching applications that already know the handle;
+all format checks, geometry decoding, index validation, and event-count validation remain enabled.
+Run the exact comparison with:
+
+```bash
+BENCH_CPU=12 SAMPLES=5 ITERATIONS=100 WARMUP=10 scripts/bench-libfst.sh
+```
+
+### Writer comparison: libfst and libfstwriter
+
+The writer harness uses LZ4 chains and each implementation's packed binary API. `wavefst batch`
+submits one timestamp as a slice; `wavefst scalar` submits individual changes. C libfst and C++14
+libfstwriter receive packed 32-bit values through `fstWriterEmitValueChange32`. Parallel codecs are
+disabled, so this measures single-threaded writer paths.
+
+| Shape | Events | wavefst batch | wavefst scalar | libfst | libfstwriter |
+|-------|-------:|--------------:|---------------:|-------:|-------------:|
+| Dense: 512 × 128 | 65,536 | 1.70 ms | 2.81 ms | 4.81 ms | 6.36 ms |
+| Wide: 8,192 × 256 | 2,097,152 | 48.14 ms | 75.70 ms | 157.04 ms | 176.33 ms |
+| Long: 32 × 65,536 | 2,097,152 | 34.74 ms | 60.32 ms | 136.25 ms | 148.89 ms |
+
+Against libfstwriter, wavefst batch is 3.75× faster on dense, 3.66× on wide, and 4.29× on long in
+this harness. Output sizes remain directly comparable:
+
+| Shape | wavefst bytes | libfst bytes | libfstwriter bytes |
+|-------|--------------:|-------------:|-------------------:|
+| Dense | 48,223 | 48,193 | 48,193 |
+| Wide | 1,395,777 | 1,395,407 | 1,395,407 |
+| Long | 1,049,820 | 1,258,921 | 1,258,921 |
+
+Reproduce both timing and size tables with:
+
+```bash
+BENCH_CPU=12 SAMPLES=5 scripts/bench-writers.sh
+```
+
+### Choosing the fast path
 
 The ordinary value-change iterator prioritises ergonomic per-event error handling. Hot paths can
 choose ordered `try_for_each_parts`, cache-friendly handle-major `try_for_each_parts_unordered`, or
@@ -211,9 +273,10 @@ buffers. Dynamic-chain deduplication uses a randomized fast hash while still com
 chain bytes, so hash collisions cannot change alias correctness.
 
 Gzip and zlib use bundled libdeflate through safe Rust bindings. Zlib value chains reuse compressor
-state and scratch storage within a block, while chain readers reuse decompressors within each
-serial or Rayon partition. This reduces setup and allocation cost without changing the standard
-FST representation.
+state and scratch storage within a block, while chain readers reuse thread-local decompressors on
+serial paths and one decompressor per Rayon partition. The reader's 64 KiB seek-aware buffer also
+satisfies FST trailer/index backtracking from memory when possible instead of issuing redundant
+kernel seeks. These optimizations do not change validation or the standard FST representation.
 
 ## Async, SIMD, and serde helpers
 
@@ -230,8 +293,12 @@ FST representation.
 
 - **Tests** – `cargo test` (add `--features "async gzip serde simd"` to exercise optional paths).
 - **Benches** – `cargo bench` compares reader/writer throughput across compression modes.
-- **libfst comparison** – `scripts/bench-libfst.sh` benchmarks both implementations on identical
-  dense data and verifies both cross-reader event counts.
+- **libfst comparison** – `scripts/bench-libfst.sh` measures cross-format full and selective reads
+  plus dense zlib writing against the pinned C reference.
+- **Rust reader comparison** – `scripts/bench-wellen.sh` compares full scans, indexed single-signal
+  reads, and hierarchy opening against pinned Wellen across dense, wide, and long traces.
+- **Writer comparison** – `scripts/bench-writers.sh` compares wavefst batch/scalar paths with pinned
+  libfst and libfstwriter on identical LZ4 workloads.
 - **Interop fixture** – the checked-in `hdl-example.fst` event count is compared with the reference
   `fstReaderIterBlocks` result.
 - **Upstream oracle** – `scripts/test-libfst-interop.sh` compiles pinned libfst independently and
@@ -250,5 +317,5 @@ event timestamps.
 
 ## License
 
-Licensed under the modified MIT License. See [LICENSE](./LICENSE) for details.
+Licensed under the standard MIT License. See [LICENSE](./LICENSE) for details.
 Release notes are maintained in [CHANGELOG.md](./CHANGELOG.md).

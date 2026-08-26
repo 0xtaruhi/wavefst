@@ -27,6 +27,7 @@ impl GeomEntry {
         Ok(Self::Fixed(storage_width))
     }
 
+    #[inline]
     fn from_raw(value: u64) -> Result<Self> {
         match value {
             0 => Ok(GeomEntry::Real),

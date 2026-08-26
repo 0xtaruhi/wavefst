@@ -273,10 +273,11 @@ impl HierarchyBlock {
 
     fn parse_stream(data: &[u8]) -> Result<Self> {
         let mut offset = 0usize;
+        let estimated_declarations = data.len() / 8;
         let mut scopes = Vec::new();
-        let mut variables = Vec::new();
+        let mut variables = Vec::with_capacity(estimated_declarations);
         let mut attributes = Vec::new();
-        let mut items = Vec::new();
+        let mut items = Vec::with_capacity(estimated_declarations);
         let mut scope_stack: Vec<usize> = Vec::new();
         let mut current_handle: u32 = 0;
 
@@ -568,7 +569,11 @@ fn decode_lz4_duo(payload: &[u8], expected: usize) -> Result<Vec<u8>> {
 }
 
 fn read_cstring(data: &[u8], offset: &mut usize) -> Result<String> {
-    Ok(String::from_utf8_lossy(&read_cbytes(data, offset)?).into_owned())
+    let bytes = read_cbytes(data, offset)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    })
 }
 
 fn read_cbytes(data: &[u8], offset: &mut usize) -> Result<Vec<u8>> {
