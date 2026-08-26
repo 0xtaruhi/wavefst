@@ -1,3 +1,5 @@
+#![cfg(all(feature = "reader", feature = "writer"))]
+
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fs::File;

@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-wavefst = { path = "../..", default-features = false, features = ["gzip", "lz4"] }
+wavefst = { path = "../..", default-features = false, features = ["reader", "writer", "gzip", "lz4"] }
 wellen = "=0.25.6"
 
 [profile.release]

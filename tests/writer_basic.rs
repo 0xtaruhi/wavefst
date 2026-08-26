@@ -1,4 +1,8 @@
-#![cfg(any(feature = "gzip", feature = "lz4"))]
+#![cfg(all(
+    feature = "reader",
+    feature = "writer",
+    any(feature = "gzip", feature = "lz4")
+))]
 
 use std::borrow::Cow;
 #[cfg(feature = "gzip")]
@@ -425,10 +429,9 @@ fn writer_compresses_redundant_frame_payloads() -> Result<()> {
     );
     assert_eq!(
         block
-            .chains
+            .index
             .iter()
-            .flatten()
-            .filter(|chain| chain.alias_of.is_some())
+            .filter(|(_, slot)| slot.alias_of().is_some())
             .count(),
         handle_count - 1,
         "identical chains should use dynamic aliases instead of duplicate payloads"

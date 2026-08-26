@@ -14,9 +14,56 @@ use crate::types::{FstByteOrder, SignalValue};
 const FST_RCV_STR: [char; 8] = ['x', 'z', 'h', 'u', 'w', 'l', '-', '?'];
 const NO_CURSOR: usize = usize::MAX;
 
-#[inline]
-fn aliases_for(alias_map: &[Vec<u32>], handle: u32) -> &[u32] {
-    alias_map.get(handle as usize).map_or(&[], Vec::as_slice)
+enum AliasMap {
+    Dense(Vec<Vec<u32>>),
+    Sparse(Vec<(u32, Vec<u32>)>),
+}
+
+impl AliasMap {
+    fn build(index: &ChainIndex, included: Option<&[u32]>) -> Self {
+        const MAX_SPARSE_GROUPS: usize = 1_024;
+        let mut sparse = Vec::<(u32, Vec<u32>)>::new();
+        let mut dense: Option<Vec<Vec<u32>>> = None;
+        for (alias, slot) in index.iter() {
+            let Some(canonical) = slot.alias_of() else {
+                continue;
+            };
+            if included.is_some_and(|handles| handles.binary_search(&alias).is_err()) {
+                continue;
+            }
+            if let Some(groups) = dense.as_mut() {
+                groups[canonical as usize].push(alias);
+                continue;
+            }
+            match sparse.binary_search_by_key(&canonical, |(handle, _)| *handle) {
+                Ok(position) => sparse[position].1.push(alias),
+                Err(position) if sparse.len() < MAX_SPARSE_GROUPS => {
+                    sparse.insert(position, (canonical, vec![alias]));
+                }
+                Err(_) => {
+                    let mut groups = Vec::new();
+                    groups.resize_with(index.max_handle() as usize + 1, Vec::new);
+                    for (handle, aliases) in sparse.drain(..) {
+                        groups[handle as usize] = aliases;
+                    }
+                    groups[canonical as usize].push(alias);
+                    dense = Some(groups);
+                }
+            }
+        }
+        dense.map_or(Self::Sparse(sparse), Self::Dense)
+    }
+
+    #[inline]
+    fn get(&self, handle: u32) -> &[u32] {
+        match self {
+            Self::Dense(aliases) => aliases.get(handle as usize).map_or(&[], Vec::as_slice),
+            Self::Sparse(aliases) => aliases
+                .binary_search_by_key(&handle, |(canonical, _)| *canonical)
+                .ok()
+                .map_or(&[], |index| aliases[index].1.as_slice()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -301,7 +348,7 @@ pub struct VcBlockChanges<'a> {
     schedule_heads: Vec<usize>,
     schedule_next: Vec<usize>,
     pending_aliases: VecDeque<ValueChange<'a>>,
-    alias_map: Vec<Vec<u32>>,
+    alias_map: AliasMap,
     time_index: usize,
     end_time_index: usize,
 }
@@ -330,14 +377,8 @@ impl<'a> VcBlockChanges<'a> {
         };
         let included_handles = block.included_handles.as_deref();
         let mut cursors = Vec::new();
-        for (idx, chain_opt) in block.chains.iter().enumerate() {
-            let Some(chain) = chain_opt else {
-                continue;
-            };
-            if chain.alias_of.is_some() {
-                continue;
-            }
-            let handle = (idx + 1) as u32;
+        for chain in &block.chains {
+            let handle = chain.handle;
             let emit_canonical =
                 included_handles.is_none_or(|handles| handles.binary_search(&handle).is_ok());
             let geom_entry = geom.entry(handle).ok_or_else(|| {
@@ -375,21 +416,7 @@ impl<'a> VcBlockChanges<'a> {
             }
         }
 
-        let mut alias_map = Vec::new();
-        for (slot_idx, slot_opt) in alias_index.slots.iter().enumerate() {
-            let Some(slot) = slot_opt else {
-                continue;
-            };
-            if let Some(canon) = slot.alias_of {
-                let alias = (slot_idx + 1) as u32;
-                if included_handles.is_none_or(|handles| handles.binary_search(&alias).is_ok()) {
-                    if alias_map.is_empty() {
-                        alias_map.resize_with(alias_index.slots.len() + 1, Vec::new);
-                    }
-                    alias_map[canon as usize].push(alias);
-                }
-            }
-        }
+        let alias_map = AliasMap::build(alias_index, included_handles);
 
         Ok(Self {
             block,
@@ -437,7 +464,7 @@ impl<'a> VcBlockChanges<'a> {
             }
 
             let handle = cursor.handle;
-            let aliases = aliases_for(&self.alias_map, handle);
+            let aliases = self.alias_map.get(handle);
             if cursor.emit_canonical && aliases.is_empty() {
                 visitor(ValueChange {
                     timestamp,
@@ -522,7 +549,7 @@ impl<'a> VcBlockChanges<'a> {
                 }
 
                 let handle = cursor.handle;
-                let aliases = aliases_for(&self.alias_map, handle);
+                let aliases = self.alias_map.get(handle);
                 if cursor.emit_canonical && aliases.is_empty() {
                     accumulator = fold(accumulator, timestamp, handle, None, value);
                 } else {
@@ -597,7 +624,7 @@ impl<'a> VcBlockChanges<'a> {
                 }
 
                 let handle = cursor.handle;
-                let aliases = aliases_for(&self.alias_map, handle);
+                let aliases = self.alias_map.get(handle);
                 if cursor.emit_canonical {
                     accumulator = fold(accumulator, timestamp, handle, None, value);
                 }
@@ -625,7 +652,7 @@ impl<'a> VcBlockChanges<'a> {
     {
         for mut cursor in self.cursors {
             let handle = cursor.handle;
-            let aliases = aliases_for(&self.alias_map, handle);
+            let aliases = self.alias_map.get(handle);
             while let Some(delta) = cursor.peek_delta()? {
                 let time_index = cursor
                     .current_time_index
@@ -675,7 +702,7 @@ impl<'a> VcBlockChanges<'a> {
             .into_par_iter()
             .try_for_each(|mut cursor| -> Result<()> {
                 let handle = cursor.handle;
-                let handle_aliases = aliases_for(aliases, handle);
+                let handle_aliases = aliases.get(handle);
                 while let Some(delta) = cursor.peek_delta()? {
                     let time_index = cursor
                         .current_time_index
@@ -732,7 +759,7 @@ impl<'a> VcBlockChanges<'a> {
             .map(|mut cursor| -> Result<T> {
                 let mut accumulator = init_ref();
                 let handle = cursor.handle;
-                let handle_aliases = aliases_for(aliases, handle);
+                let handle_aliases = aliases.get(handle);
                 while let Some(delta) = cursor.peek_delta()? {
                     let time_index = cursor
                         .current_time_index
@@ -812,15 +839,13 @@ impl<'a> VcBlockChanges<'a> {
             }
 
             let handle = cursor.handle;
-            if let Some(aliases) = self.alias_map.get(handle as usize) {
-                for &alias in aliases {
-                    self.pending_aliases.push_back(ValueChange {
-                        timestamp,
-                        handle: alias,
-                        alias_of: Some(handle),
-                        value: value.clone(),
-                    });
-                }
+            for &alias in self.alias_map.get(handle) {
+                self.pending_aliases.push_back(ValueChange {
+                    timestamp,
+                    handle: alias,
+                    alias_of: Some(handle),
+                    value: value.clone(),
+                });
             }
             if cursor.emit_canonical {
                 return Ok(Some(ValueChange {

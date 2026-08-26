@@ -1,6 +1,6 @@
 [package]
 name = "wavefst"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "Modern Rust implementation of the Fast Signal Trace (FST) binary waveform format."
 authors = ["Zhengyi Zhang <zhang_zhengyi@outlook.com>"]
@@ -11,19 +11,23 @@ keywords = ["fst", "waveform", "gtkwave", "verilog", "vhdl"]
 categories = ["encoding", "parser-implementations", "science"]
 
 [features]
-default = ["gzip", "lz4", "mmap", "parallel", "simd"]
+default = ["reader", "writer", "gzip", "lz4", "simd"]
 
+reader = []
+writer = ["dep:ahash"]
 gzip = ["dep:libdeflater"]
 lz4 = ["dep:lz4_flex"]
 fastlz = ["dep:fastlz-sys"]
 parallel = ["dep:rayon"]
-serde = ["dep:serde"]
-mmap = ["dep:memmap2"]
-async = ["dep:tokio"]
-simd = []
+serde = ["reader", "dep:serde"]
+mmap = ["reader", "dep:memmap2"]
+async-read = ["reader", "dep:tokio"]
+async-write = ["writer", "dep:tokio"]
+async = ["async-read", "async-write"]
+simd = ["writer"]
 
 [dependencies]
-ahash = "0.8"
+ahash = { version = "0.8", optional = true }
 num_enum = "0.7"
 thiserror = "2.0"
 
@@ -43,10 +47,24 @@ tempfile = "3.10"
 [[bench]]
 name = "reader"
 harness = false
+required-features = ["reader", "writer"]
 
 [[bench]]
 name = "writer"
 harness = false
+required-features = ["writer"]
+
+[[example]]
+name = "libfst_bench"
+required-features = ["reader", "writer"]
+
+[[example]]
+name = "write_fst"
+required-features = ["writer"]
+
+[[example]]
+name = "writer_ecosystem_bench"
+required-features = ["writer"]
 
 [package.metadata.docs.rs]
 all-features = true

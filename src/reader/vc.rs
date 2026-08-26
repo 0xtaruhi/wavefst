@@ -14,11 +14,11 @@ use lz4_flex::block::decompress as lz4_decompress;
 use crate::block::{FrameSection, PackMarker, TimeSection, TimeTable, VcBlock};
 #[cfg(feature = "gzip")]
 use crate::compression::{with_decompressor, zlib_decompress_into_with, zlib_decompress_with};
-use crate::encoding::{decode_svarint, decode_varint_with_len};
+use crate::encoding::{decode_svarint_with_len, decode_varint_with_len};
 use crate::error::{Error, Result};
-use crate::types::{BlockType, FstByteOrder, PackType};
+use crate::types::{BlockType, CodecParallelism, FstByteOrder, PackType};
 #[cfg(feature = "parallel")]
-use crate::util::{codec_partition_len, in_codec_pool};
+use crate::util::{codec_partition_len, codec_pool};
 use crate::util::{read_u64_be, read_varint_from_reader};
 
 /// Fully decoded metadata and payload slices extracted from a value-change block.
@@ -32,8 +32,8 @@ pub struct VcBlockMeta {
     pub chain_buffer: Vec<u8>,
     /// Arena containing chains that required decompression.
     pub decoded_chain_buffer: Vec<u8>,
-    /// Per-handle resolved change chains; index zero corresponds to handle one.
-    pub chains: Vec<Option<ChainData>>,
+    /// Canonical change chains present in this block.
+    pub chains: Vec<ChainData>,
     /// Metadata describing the encoded time table.
     pub time_section: TimeSection,
     /// Fully decoded timestamp table.
@@ -51,8 +51,67 @@ pub struct VcBlockMeta {
 /// Resolved per-handle chain metadata extracted from the block index.
 #[derive(Debug, Clone, Default)]
 pub struct ChainIndex {
-    /// Per-handle slots; index zero corresponds to handle one.
-    pub slots: Vec<Option<ChainSlot>>,
+    dense_slots: Vec<Option<ChainSlot>>,
+    sparse_slots: Vec<(u32, ChainSlot)>,
+    max_handle: u32,
+}
+
+impl ChainIndex {
+    fn dense(slots: Vec<Option<ChainSlot>>) -> Self {
+        Self {
+            max_handle: slots.len() as u32,
+            dense_slots: slots,
+            sparse_slots: Vec::new(),
+        }
+    }
+
+    fn sparse(max_handle: usize, mut slots: Vec<(u32, ChainSlot)>) -> Result<Self> {
+        slots.sort_unstable_by_key(|(handle, _)| *handle);
+        slots.dedup_by_key(|(handle, _)| *handle);
+        Ok(Self {
+            dense_slots: Vec::new(),
+            sparse_slots: slots,
+            max_handle: u32::try_from(max_handle)
+                .map_err(|_| Error::invalid("chain index handle count exceeds u32 range"))?,
+        })
+    }
+
+    /// Returns the highest handle represented by the on-disk index.
+    #[must_use]
+    pub fn max_handle(&self) -> u32 {
+        self.max_handle
+    }
+
+    /// Looks up a one-based handle without materializing empty slots for sparse selections.
+    #[must_use]
+    pub fn get(&self, handle: u32) -> Option<&ChainSlot> {
+        if handle == 0 || handle > self.max_handle {
+            return None;
+        }
+        if self.sparse_slots.is_empty() {
+            return self
+                .dense_slots
+                .get((handle - 1) as usize)
+                .and_then(Option::as_ref);
+        }
+        self.sparse_slots
+            .binary_search_by_key(&handle, |(candidate, _)| *candidate)
+            .ok()
+            .map(|index| &self.sparse_slots[index].1)
+    }
+
+    /// Iterates non-empty slots as `(one_based_handle, slot)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &ChainSlot)> {
+        self.dense_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|slot| ((index + 1) as u32, slot)))
+            .chain(
+                self.sparse_slots
+                    .iter()
+                    .map(|(handle, slot)| (*handle, slot)),
+            )
+    }
 }
 
 /// Offset/length pair describing where compressed chain data resides for a handle.
@@ -62,8 +121,15 @@ pub struct ChainSlot {
     pub offset: u64,
     /// Stored chain length in bytes.
     pub length: u32,
-    /// Canonical handle when this slot is a dynamic alias.
-    pub alias_of: Option<u32>,
+    alias_handle: u32,
+}
+
+impl ChainSlot {
+    /// Returns the canonical handle when this slot is a dynamic alias.
+    #[must_use]
+    pub fn alias_of(&self) -> Option<u32> {
+        (self.alias_handle != 0).then_some(self.alias_handle)
+    }
 }
 
 /// In-memory representation of a handle's change stream.
@@ -75,8 +141,6 @@ pub struct ChainData {
     pub stored_len: u32,
     /// Location of the decoded payload in one of the block arenas.
     pub payload: ChainPayload,
-    /// Canonical handle when this chain is a dynamic alias.
-    pub alias_of: Option<u32>,
 }
 
 /// Slice containing uncompressed chain bytes.
@@ -98,13 +162,14 @@ pub(crate) struct VcParseOptions<'a> {
     pub max_block_bytes: u64,
     pub max_handles: u64,
     pub double_byte_order: FstByteOrder,
+    pub codec_parallelism: CodecParallelism,
     pub included_handles: Option<&'a [u32]>,
     pub time_range: Option<RangeInclusive<u64>>,
 }
 
 struct ChainStorage {
     stored: Vec<u8>,
-    chains: Vec<Option<ChainData>>,
+    chains: Vec<ChainData>,
     decoded: Vec<u8>,
 }
 
@@ -260,11 +325,14 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
     let index = decode_chain_index(
         reader,
         block_type,
-        index_start,
-        index_length,
-        vc_max_handle_usize,
-        chain_start,
-        chain_end,
+        ChainIndexLayout {
+            index_start,
+            index_length,
+            chain_start,
+            chain_end,
+            max_handle: vc_max_handle_usize,
+        },
+        options.included_handles,
     )?;
 
     reader.seek(SeekFrom::Start(time_data_start))?;
@@ -293,6 +361,7 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
                 chain_start,
                 &index,
                 header.pack_marker.pack_type,
+                options.codec_parallelism,
             )?;
             ChainStorage {
                 stored: chain_buffer,
@@ -300,9 +369,13 @@ pub(crate) fn parse_vc_block<R: Read + Seek>(
                 decoded: decoded_chain_buffer,
             }
         }
-        Some(handles) => {
-            read_selected_chains(reader, &index, handles, header.pack_marker.pack_type)?
-        }
+        Some(handles) => read_selected_chains(
+            reader,
+            &index,
+            handles,
+            header.pack_marker.pack_type,
+            options.codec_parallelism,
+        )?,
     };
 
     reader.seek(SeekFrom::Start(block_end))?;
@@ -327,30 +400,29 @@ fn read_selected_chains<R: Read + Seek>(
     index: &ChainIndex,
     included_handles: &[u32],
     pack_type: PackType,
+    codec_parallelism: CodecParallelism,
 ) -> Result<ChainStorage> {
     let mut canonical_needed = Vec::with_capacity(included_handles.len());
     for &handle in included_handles {
-        let handle_index = (handle - 1) as usize;
-        let Some(slot) = index.slots.get(handle_index).and_then(Option::as_ref) else {
+        let Some(slot) = index.get(handle) else {
             continue;
         };
-        let canonical = slot.alias_of.unwrap_or(handle);
-        let canonical_index = (canonical - 1) as usize;
-        if canonical_index >= index.slots.len() {
+        let canonical = slot.alias_of().unwrap_or(handle);
+        if canonical > index.max_handle() {
             return Err(Error::decode("dynamic alias target exceeds chain index"));
         }
-        canonical_needed.push(canonical_index);
+        canonical_needed.push(canonical);
     }
     canonical_needed.sort_unstable();
     canonical_needed.dedup();
 
     let mut chain_buffer = Vec::new();
-    let mut filtered_slots = vec![None; index.slots.len()];
-    for handle_index in canonical_needed {
-        let slot = index.slots[handle_index]
-            .as_ref()
+    let mut filtered_slots = Vec::with_capacity(canonical_needed.len() + included_handles.len());
+    for handle in canonical_needed {
+        let slot = index
+            .get(handle)
             .ok_or_else(|| Error::decode("selected canonical handle has no chain slot"))?;
-        if slot.alias_of.is_some() {
+        if slot.alias_of().is_some() {
             return Err(Error::decode("resolved canonical chain is still an alias"));
         }
         let length = usize::try_from(slot.length)
@@ -367,36 +439,41 @@ fn read_selected_chains<R: Read + Seek>(
         let compact_slot = ChainSlot {
             offset: compact_offset,
             length: slot.length,
-            alias_of: None,
+            alias_handle: 0,
         };
-        filtered_slots[handle_index] = Some(compact_slot);
+        filtered_slots.push((handle, compact_slot));
     }
 
     for &handle in included_handles {
-        let handle_index = (handle - 1) as usize;
-        let Some(slot) = index.slots.get(handle_index).and_then(Option::as_ref) else {
+        let Some(slot) = index.get(handle) else {
             continue;
         };
-        let Some(canonical) = slot.alias_of else {
+        let Some(canonical) = slot.alias_of() else {
             continue;
         };
-        let canonical_index = (canonical - 1) as usize;
         let canonical_slot = filtered_slots
-            .get(canonical_index)
-            .and_then(Option::as_ref)
+            .iter()
+            .find(|(candidate, _)| *candidate == canonical)
+            .map(|(_, slot)| *slot)
             .ok_or_else(|| Error::decode("selected alias target has no loaded chain"))?;
-        filtered_slots[handle_index] = Some(ChainSlot {
-            offset: canonical_slot.offset,
-            length: canonical_slot.length,
-            alias_of: Some(canonical),
-        });
+        filtered_slots.push((
+            handle,
+            ChainSlot {
+                offset: canonical_slot.offset,
+                length: canonical_slot.length,
+                alias_handle: canonical,
+            },
+        ));
     }
 
-    let filtered_index = ChainIndex {
-        slots: filtered_slots,
-    };
-    let (chains, decoded_chain_buffer) =
-        build_chains(&chain_buffer, 0, &filtered_index, pack_type)?;
+    let filtered_index = ChainIndex::sparse(index.max_handle() as usize, filtered_slots)?;
+    let (chains, decoded_chain_buffer) = build_chains(
+        &chain_buffer,
+        0,
+        &filtered_index,
+        pack_type,
+        codec_parallelism,
+    )?;
     Ok(ChainStorage {
         stored: chain_buffer,
         chains,
@@ -409,29 +486,27 @@ fn build_chains(
     chain_start: u64,
     index: &ChainIndex,
     pack_type: PackType,
-) -> Result<(Vec<Option<ChainData>>, Vec<u8>)> {
+    codec_parallelism: CodecParallelism,
+) -> Result<(Vec<ChainData>, Vec<u8>)> {
+    #[cfg(not(feature = "parallel"))]
+    let _ = codec_parallelism;
     struct ChainJob<'a> {
-        handle_index: usize,
-        alias_of: Option<u32>,
+        handle: u32,
         stored_len: u64,
         compressed: &'a [u8],
     }
 
     struct ChainJobResult {
-        handle_index: usize,
-        alias_of: Option<u32>,
+        handle: u32,
         stored_len: u32,
         payload: Vec<u8>,
     }
 
-    let mut chains = vec![None; index.slots.len()];
+    let mut chains = Vec::new();
     let mut jobs = Vec::new();
 
-    for (handle_index, slot_opt) in index.slots.iter().enumerate() {
-        let Some(slot) = slot_opt else {
-            continue;
-        };
-        if slot.alias_of.is_some() {
+    for (handle, slot) in index.iter() {
+        if slot.alias_of().is_some() {
             continue;
         }
 
@@ -459,18 +534,16 @@ fn build_chains(
         if stored_len == 0 {
             let range_start = rel_offset + consumed;
             let range_end = rel_offset + length;
-            chains[handle_index] = Some(ChainData {
-                handle: (handle_index + 1) as u32,
+            chains.push(ChainData {
+                handle,
                 stored_len: (length - consumed) as u32,
                 payload: ChainPayload::Borrowed {
                     range: range_start..range_end,
                 },
-                alias_of: slot.alias_of,
             });
         } else {
             jobs.push(ChainJob {
-                handle_index,
-                alias_of: slot.alias_of,
+                handle,
                 stored_len,
                 compressed: payload_bytes,
             });
@@ -481,19 +554,11 @@ fn build_chains(
     let decoded_bytes = jobs
         .iter()
         .fold(0_u64, |total, job| total.saturating_add(job.stored_len));
-    #[cfg(feature = "gzip")]
-    let direct_zlib = if pack_type != PackType::Zlib {
-        false
-    } else {
-        #[cfg(feature = "parallel")]
-        {
-            jobs.len() < 32 || decoded_bytes < 64 * 1024
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            true
-        }
-    };
+    #[cfg(all(feature = "gzip", feature = "parallel"))]
+    let direct_zlib = pack_type == PackType::Zlib
+        && (codec_parallelism.is_serial() || jobs.len() < 32 || decoded_bytes < 64 * 1024);
+    #[cfg(all(feature = "gzip", not(feature = "parallel")))]
+    let direct_zlib = pack_type == PackType::Zlib;
     #[cfg(feature = "gzip")]
     if direct_zlib {
         return with_decompressor(|decoder| {
@@ -519,15 +584,13 @@ fn build_chains(
                 )?;
                 let stored_len = u32::try_from(job.stored_len)
                     .map_err(|_| Error::decode("chain stored length exceeds u32 range"))?;
-                chains[job.handle_index] = Some(ChainData {
-                    handle: (job.handle_index + 1) as u32,
+                chains.push(ChainData {
+                    handle: job.handle,
                     stored_len,
                     payload: ChainPayload::Decoded { range: cursor..end },
-                    alias_of: job.alias_of,
                 });
                 cursor = end;
             }
-            resolve_chain_aliases(index, &mut chains)?;
             Ok((chains, decoded_arena))
         });
     }
@@ -536,8 +599,7 @@ fn build_chains(
         let stored_len = u32::try_from(job.stored_len)
             .map_err(|_| Error::decode("chain stored length exceeds u32 range"))?;
         Ok(ChainJobResult {
-            handle_index: job.handle_index,
-            alias_of: job.alias_of,
+            handle: job.handle,
             stored_len,
             payload: data,
         })
@@ -559,20 +621,24 @@ fn build_chains(
 
     #[cfg(feature = "parallel")]
     let results: Vec<ChainJobResult> = {
-        if pack_type == PackType::Lz4 || jobs.len() < 32 || decoded_bytes < 64 * 1024 {
+        if codec_parallelism.is_serial()
+            || (pack_type == PackType::Lz4 && matches!(codec_parallelism, CodecParallelism::Auto))
+            || jobs.len() < 32
+            || decoded_bytes < 64 * 1024
+        {
             jobs.into_iter().map(decompress).collect::<Result<_>>()?
-        } else {
-            let partition_len = codec_partition_len(jobs.len());
+        } else if let Some(pool) = codec_pool(codec_parallelism) {
+            let partition_len = codec_partition_len(jobs.len(), codec_parallelism);
             #[cfg(feature = "gzip")]
             if pack_type == PackType::Zlib {
-                in_codec_pool(|| {
+                pool.install(|| {
                     jobs.into_par_iter()
                         .with_min_len(partition_len)
                         .map_init(LibdeflateDecompressor::new, decompress_native)
                         .collect::<Result<Vec<_>>>()
                 })?
             } else {
-                in_codec_pool(|| {
+                pool.install(|| {
                     jobs.into_par_iter()
                         .with_min_len(partition_len)
                         .map(decompress)
@@ -580,12 +646,14 @@ fn build_chains(
                 })?
             }
             #[cfg(not(feature = "gzip"))]
-            in_codec_pool(|| {
+            pool.install(|| {
                 jobs.into_par_iter()
                     .with_min_len(partition_len)
                     .map(decompress)
                     .collect::<Result<Vec<_>>>()
             })?
+        } else {
+            jobs.into_iter().map(decompress).collect::<Result<_>>()?
         }
     };
 
@@ -599,48 +667,17 @@ fn build_chains(
         let start = decoded_arena.len();
         decoded_arena.extend_from_slice(&result.payload);
         let end = decoded_arena.len();
-        decoded_meta.push((
-            result.handle_index,
-            result.alias_of,
-            result.stored_len,
-            start..end,
-        ));
+        decoded_meta.push((result.handle, result.stored_len, start..end));
     }
-    for (handle_index, alias_of, stored_len, range) in decoded_meta {
-        chains[handle_index] = Some(ChainData {
-            handle: (handle_index + 1) as u32,
+    for (handle, stored_len, range) in decoded_meta {
+        chains.push(ChainData {
+            handle,
             stored_len,
             payload: ChainPayload::Decoded { range },
-            alias_of,
         });
     }
-
-    resolve_chain_aliases(index, &mut chains)?;
 
     Ok((chains, decoded_arena))
-}
-
-fn resolve_chain_aliases(index: &ChainIndex, chains: &mut [Option<ChainData>]) -> Result<()> {
-    for (handle_index, slot_opt) in index.slots.iter().enumerate() {
-        let Some(slot) = slot_opt else {
-            continue;
-        };
-        let Some(target) = slot.alias_of else {
-            continue;
-        };
-        let target_index = (target - 1) as usize;
-        let canonical = chains
-            .get(target_index)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| Error::decode("dynamic alias target has no canonical chain"))?;
-        chains[handle_index] = Some(ChainData {
-            handle: (handle_index + 1) as u32,
-            stored_len: canonical.stored_len,
-            payload: canonical.payload.clone(),
-            alias_of: Some(target),
-        });
-    }
-    Ok(())
 }
 
 fn decompress_chain_payload(
@@ -728,135 +765,389 @@ fn decompress_chain_payload(
     }
 }
 
-fn decode_chain_index<R: Read + Seek>(
-    reader: &mut R,
-    block_type: BlockType,
+#[derive(Debug, Clone, Copy)]
+enum EntryTmp {
+    Empty,
+    Data { offset: u64, length: u32 },
+    Alias { target: usize },
+}
+
+struct SelectedIndexScan {
+    selected: Vec<(u32, u32)>,
+    data_offsets: Vec<(u32, u64)>,
+}
+
+struct ChainIndexLayout {
     index_start: u64,
     index_length: u64,
-    max_handle_hint: usize,
     chain_start: u64,
     chain_end: u64,
-) -> Result<ChainIndex> {
-    reader.seek(SeekFrom::Start(index_start))?;
-    let index_len_usize = usize::try_from(index_length)
-        .map_err(|_| Error::invalid("index length exceeds addressable memory"))?;
-    let mut bytes = vec![0u8; index_len_usize];
-    reader.read_exact(&mut bytes)?;
+    max_handle: usize,
+}
 
-    #[derive(Debug, Clone, Copy)]
-    enum EntryTmp {
-        Empty,
-        Data { offset: u64, length: Option<u32> },
-        Alias { target: usize },
-    }
+fn scan_chain_index<F>(
+    bytes: &[u8],
+    block_type: BlockType,
+    max_handle_hint: usize,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(usize, EntryTmp) -> Result<()>,
+{
+    let mut slice = bytes;
+    let mut handle_index = 0_usize;
+    let mut last_offset = 0_u64;
+    let mut last_alias_target = None;
 
-    let mut entries: Vec<EntryTmp> = Vec::with_capacity(max_handle_hint);
-    let mut slice = bytes.as_slice();
-    let mut last_offset = 0u64;
-    let mut last_alias_target: Option<usize> = None;
+    let push = |entry, visit: &mut F, handle_index: &mut usize| -> Result<()> {
+        if *handle_index >= max_handle_hint {
+            return Err(Error::decode("chain index contains too many handles"));
+        }
+        visit(*handle_index, entry)?;
+        *handle_index += 1;
+        Ok(())
+    };
 
     while !slice.is_empty() {
         if block_type == BlockType::VcDataDynAlias2 && (slice[0] & 0x01) != 0 {
-            let mut tmp = slice;
-            let raw = decode_svarint(&mut tmp)?;
+            let (raw, consumed) = decode_svarint_with_len(slice)?;
             let shval = raw >> 1;
-            slice = tmp;
-
+            slice = &slice[consumed..];
             if shval > 0 {
-                if entries.len() >= max_handle_hint {
-                    return Err(Error::decode("chain index contains too many handles"));
-                }
                 last_offset = last_offset
                     .checked_add(shval as u64)
                     .ok_or_else(|| Error::decode("chain index overflow"))?;
-                entries.push(EntryTmp::Data {
-                    offset: last_offset,
-                    length: None,
-                });
+                push(
+                    EntryTmp::Data {
+                        offset: last_offset,
+                        length: 0,
+                    },
+                    &mut visit,
+                    &mut handle_index,
+                )?;
                 last_alias_target = None;
             } else if shval < 0 {
-                if entries.len() >= max_handle_hint {
-                    return Err(Error::decode("chain index contains too many handles"));
-                }
                 let target = ((-shval) as u64)
                     .checked_sub(1)
                     .ok_or_else(|| Error::decode("invalid alias target"))?;
                 let target = usize::try_from(target)
                     .map_err(|_| Error::decode("alias target exceeds addressable range"))?;
-                entries.push(EntryTmp::Alias { target });
+                push(EntryTmp::Alias { target }, &mut visit, &mut handle_index)?;
                 last_alias_target = Some(target);
             } else if let Some(target) = last_alias_target {
-                if entries.len() >= max_handle_hint {
-                    return Err(Error::decode("chain index contains too many handles"));
-                }
-                entries.push(EntryTmp::Alias { target });
+                push(EntryTmp::Alias { target }, &mut visit, &mut handle_index)?;
             } else {
-                if entries.len() >= max_handle_hint {
-                    return Err(Error::decode("chain index contains too many handles"));
-                }
-                entries.push(EntryTmp::Empty);
+                push(EntryTmp::Empty, &mut visit, &mut handle_index)?;
             }
             continue;
         }
 
         let (value, consumed) = decode_varint_with_len(slice)?;
         slice = &slice[consumed..];
-
         if value == 0 {
             let (alias, alias_consumed) = decode_varint_with_len(slice)?;
             slice = &slice[alias_consumed..];
             if alias == 0 {
-                if entries.len() >= max_handle_hint {
-                    return Err(Error::decode("chain index contains too many handles"));
-                }
-                entries.push(EntryTmp::Empty);
+                push(EntryTmp::Empty, &mut visit, &mut handle_index)?;
                 last_alias_target = None;
             } else {
-                if entries.len() >= max_handle_hint {
-                    return Err(Error::decode("chain index contains too many handles"));
-                }
-                let target = alias
-                    .checked_sub(1)
-                    .ok_or_else(|| Error::decode("invalid alias handle"))?;
-                let target = usize::try_from(target)
+                let target = usize::try_from(alias - 1)
                     .map_err(|_| Error::decode("alias target exceeds addressable range"))?;
-                entries.push(EntryTmp::Alias { target });
+                push(EntryTmp::Alias { target }, &mut visit, &mut handle_index)?;
                 last_alias_target = Some(target);
             }
             continue;
         }
 
-        if (value & 1) == 0 {
+        if value & 1 == 0 {
             let repeat = usize::try_from(value >> 1)
                 .map_err(|_| Error::decode("empty chain run exceeds addressable range"))?;
-            let remaining = max_handle_hint.saturating_sub(entries.len());
+            let remaining = max_handle_hint.saturating_sub(handle_index);
             if repeat == 0 || repeat > remaining {
                 return Err(Error::decode("invalid empty run in chain index"));
             }
-            entries.extend((0..repeat).map(|_| EntryTmp::Empty));
+            for _ in 0..repeat {
+                visit(handle_index, EntryTmp::Empty)?;
+                handle_index += 1;
+            }
             continue;
         }
 
-        if entries.len() >= max_handle_hint {
-            return Err(Error::decode("chain index contains too many handles"));
-        }
-        let delta = value >> 1;
         last_offset = last_offset
-            .checked_add(delta)
+            .checked_add(value >> 1)
             .ok_or_else(|| Error::decode("chain index overflow"))?;
-        entries.push(EntryTmp::Data {
-            offset: last_offset,
-            length: None,
-        });
+        push(
+            EntryTmp::Data {
+                offset: last_offset,
+                length: 0,
+            },
+            &mut visit,
+            &mut handle_index,
+        )?;
         last_alias_target = None;
     }
 
-    if entries.len() != max_handle_hint {
+    if handle_index != max_handle_hint {
         return Err(Error::decode(format!(
-            "chain index describes {} handles, expected {max_handle_hint}",
-            entries.len()
+            "chain index describes {handle_index} handles, expected {max_handle_hint}"
         )));
     }
+    Ok(())
+}
+
+fn decode_selected_chain_index(
+    bytes: &[u8],
+    block_type: BlockType,
+    max_handle_hint: usize,
+    chain_start: u64,
+    chain_end: u64,
+    included_handles: &[u32],
+) -> Result<ChainIndex> {
+    const PACK_MARKER_PREFIX: u64 = 1;
+    let total_chain_len = chain_end
+        .checked_sub(chain_start)
+        .ok_or_else(|| Error::invalid("negative chain range"))?;
+    let scan = if block_type == BlockType::VcDataDynAlias2 {
+        scan_selected_dyn_alias2(bytes, max_handle_hint, total_chain_len, included_handles)?
+    } else {
+        let mut canonical_by_handle = vec![0_u32; max_handle_hint];
+        let mut selected = Vec::with_capacity(included_handles.len());
+        let mut selected_cursor = 0_usize;
+        let mut data_offsets = Vec::<(u32, u64)>::new();
+
+        scan_chain_index(bytes, block_type, max_handle_hint, |index, entry| {
+            let handle = u32::try_from(index + 1)
+                .map_err(|_| Error::invalid("chain index handle exceeds u32 range"))?;
+            let canonical = match entry {
+                EntryTmp::Empty => 0,
+                EntryTmp::Data { offset, .. } => {
+                    let normalized = offset
+                        .checked_sub(PACK_MARKER_PREFIX)
+                        .ok_or_else(|| Error::decode("chain offset precedes pack marker"))?;
+                    if normalized > total_chain_len {
+                        return Err(Error::decode("chain offset exceeds chain payload bounds"));
+                    }
+                    if data_offsets
+                        .last()
+                        .is_some_and(|(_, previous)| normalized < *previous)
+                    {
+                        return Err(Error::decode("chain offsets are not monotonic"));
+                    }
+                    data_offsets.push((handle, normalized));
+                    handle
+                }
+                EntryTmp::Alias { target } => {
+                    if target >= index {
+                        return Err(Error::decode("dynamic alias target must precede its alias"));
+                    }
+                    let canonical = canonical_by_handle[target];
+                    if canonical == 0 {
+                        return Err(Error::decode("dynamic alias target has no canonical chain"));
+                    }
+                    canonical
+                }
+            };
+            canonical_by_handle[index] = canonical;
+            if included_handles.get(selected_cursor) == Some(&handle) {
+                selected.push((handle, canonical));
+                selected_cursor += 1;
+            }
+            Ok(())
+        })?;
+        SelectedIndexScan {
+            selected,
+            data_offsets,
+        }
+    };
+
+    let mut needed = scan
+        .selected
+        .iter()
+        .filter_map(|(_, canonical)| (*canonical != 0).then_some(*canonical))
+        .collect::<Vec<_>>();
+    needed.sort_unstable();
+    needed.dedup();
+    let mut canonical_slots = Vec::with_capacity(needed.len());
+    for handle in needed {
+        let index = scan
+            .data_offsets
+            .binary_search_by_key(&handle, |(candidate, _)| *candidate)
+            .map_err(|_| Error::decode("selected canonical handle has no data chain"))?;
+        let offset = scan.data_offsets[index].1;
+        let end = scan
+            .data_offsets
+            .get(index + 1)
+            .map_or(total_chain_len, |(_, next_offset)| *next_offset);
+        let length = u32::try_from(
+            end.checked_sub(offset)
+                .ok_or_else(|| Error::decode("chain offsets are not monotonic"))?,
+        )
+        .map_err(|_| Error::decode("chain payload exceeds u32 range"))?;
+        canonical_slots.push((handle, offset, length));
+    }
+    let mut sparse = Vec::with_capacity(canonical_slots.len() + scan.selected.len());
+    for &(handle, offset, length) in &canonical_slots {
+        sparse.push((
+            handle,
+            ChainSlot {
+                offset: chain_start
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::invalid("chain offset overflow"))?,
+                length,
+                alias_handle: 0,
+            },
+        ));
+    }
+    for (handle, canonical) in scan.selected {
+        if canonical == 0 || handle == canonical {
+            continue;
+        }
+        let canonical_slot = sparse
+            .iter()
+            .find(|(candidate, _)| *candidate == canonical)
+            .map(|(_, slot)| *slot)
+            .ok_or_else(|| Error::decode("selected alias target has no loaded chain"))?;
+        sparse.push((
+            handle,
+            ChainSlot {
+                alias_handle: canonical,
+                ..canonical_slot
+            },
+        ));
+    }
+    ChainIndex::sparse(max_handle_hint, sparse)
+}
+
+fn scan_selected_dyn_alias2(
+    mut bytes: &[u8],
+    max_handle_hint: usize,
+    total_chain_len: u64,
+    included_handles: &[u32],
+) -> Result<SelectedIndexScan> {
+    const PACK_MARKER_PREFIX: u64 = 1;
+    let mut canonical_by_handle = vec![0_u32; max_handle_hint];
+    let mut selected = Vec::with_capacity(included_handles.len());
+    let mut data_offsets = Vec::new();
+    let mut selected_cursor = 0_usize;
+    let mut handle_index = 0_usize;
+    let mut last_offset = 0_u64;
+    let mut previous_alias_canonical = 0_u32;
+
+    while !bytes.is_empty() {
+        if bytes[0] & 1 == 0 {
+            let (encoded, consumed) = decode_varint_with_len(bytes)?;
+            bytes = &bytes[consumed..];
+            let repeat = usize::try_from(encoded >> 1)
+                .map_err(|_| Error::decode("empty chain run exceeds addressable range"))?;
+            let end = handle_index
+                .checked_add(repeat)
+                .ok_or_else(|| Error::decode("empty chain run overflows handle count"))?;
+            if repeat == 0 || end > max_handle_hint {
+                return Err(Error::decode("invalid empty run in chain index"));
+            }
+            while included_handles
+                .get(selected_cursor)
+                .is_some_and(|handle| (*handle as usize) <= end)
+            {
+                selected.push((included_handles[selected_cursor], 0));
+                selected_cursor += 1;
+            }
+            handle_index = end;
+            continue;
+        }
+
+        if handle_index >= max_handle_hint {
+            return Err(Error::decode("chain index contains too many handles"));
+        }
+        let (raw, consumed) = decode_svarint_with_len(bytes)?;
+        bytes = &bytes[consumed..];
+        let shifted = raw >> 1;
+        let handle = u32::try_from(handle_index + 1)
+            .map_err(|_| Error::invalid("chain index handle exceeds u32 range"))?;
+        let canonical = if shifted > 0 {
+            last_offset = last_offset
+                .checked_add(shifted as u64)
+                .ok_or_else(|| Error::decode("chain index overflow"))?;
+            let normalized = last_offset
+                .checked_sub(PACK_MARKER_PREFIX)
+                .ok_or_else(|| Error::decode("chain offset precedes pack marker"))?;
+            if normalized > total_chain_len {
+                return Err(Error::decode("chain offset exceeds chain payload bounds"));
+            }
+            data_offsets.push((handle, normalized));
+            previous_alias_canonical = 0;
+            handle
+        } else if shifted < 0 {
+            let target = u64::try_from(-i128::from(shifted) - 1)
+                .map_err(|_| Error::decode("invalid alias target"))?;
+            let target = usize::try_from(target)
+                .map_err(|_| Error::decode("alias target exceeds addressable range"))?;
+            if target >= handle_index {
+                return Err(Error::decode("dynamic alias target must precede its alias"));
+            }
+            let canonical = canonical_by_handle[target];
+            if canonical == 0 {
+                return Err(Error::decode("dynamic alias target has no canonical chain"));
+            }
+            previous_alias_canonical = canonical;
+            canonical
+        } else {
+            previous_alias_canonical
+        };
+        canonical_by_handle[handle_index] = canonical;
+        if included_handles.get(selected_cursor) == Some(&handle) {
+            selected.push((handle, canonical));
+            selected_cursor += 1;
+        }
+        handle_index += 1;
+    }
+
+    if handle_index != max_handle_hint {
+        return Err(Error::decode(format!(
+            "chain index describes {handle_index} handles, expected {max_handle_hint}"
+        )));
+    }
+    Ok(SelectedIndexScan {
+        selected,
+        data_offsets,
+    })
+}
+
+fn decode_chain_index<R: Read + Seek>(
+    reader: &mut R,
+    block_type: BlockType,
+    layout: ChainIndexLayout,
+    included_handles: Option<&[u32]>,
+) -> Result<ChainIndex> {
+    let ChainIndexLayout {
+        index_start,
+        index_length,
+        chain_start,
+        chain_end,
+        max_handle: max_handle_hint,
+    } = layout;
+    reader.seek(SeekFrom::Start(index_start))?;
+    let index_len_usize = usize::try_from(index_length)
+        .map_err(|_| Error::invalid("index length exceeds addressable memory"))?;
+    let mut bytes = vec![0u8; index_len_usize];
+    reader.read_exact(&mut bytes)?;
+
+    if let Some(handles) = included_handles {
+        return decode_selected_chain_index(
+            &bytes,
+            block_type,
+            max_handle_hint,
+            chain_start,
+            chain_end,
+            handles,
+        );
+    }
+
+    let mut entries: Vec<EntryTmp> = Vec::with_capacity(max_handle_hint);
+    scan_chain_index(&bytes, block_type, max_handle_hint, |_, entry| {
+        entries.push(entry);
+        Ok(())
+    })?;
 
     let total_chain_len = chain_end
         .checked_sub(chain_start)
@@ -897,7 +1188,7 @@ fn decode_chain_index<R: Read + Seek>(
             slots.push(Some(ChainSlot {
                 offset: absolute,
                 length: 0,
-                alias_of: None,
+                alias_handle: 0,
             }));
         }
         if let Some((last_idx, last_offset)) = previous_data {
@@ -910,7 +1201,7 @@ fn decode_chain_index<R: Read + Seek>(
                 .length = u32::try_from(span)
                 .map_err(|_| Error::decode("chain payload exceeds u32 range"))?;
         }
-        return Ok(ChainIndex { slots });
+        return Ok(ChainIndex::dense(slots));
     }
 
     for entry in &mut entries {
@@ -943,7 +1234,7 @@ fn decode_chain_index<R: Read + Seek>(
                 ..
             } = &mut entries[previous_idx]
             {
-                *previous_length = Some(length);
+                *previous_length = length;
             }
         }
         previous_data = Some((idx, offset));
@@ -959,30 +1250,27 @@ fn decode_chain_index<R: Read + Seek>(
             ..
         } = &mut entries[last_idx]
         {
-            *last_length = Some(length);
+            *last_length = length;
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum CanonicalResolution {
-        Unknown,
-        Missing,
-        Found(usize),
-    }
+    const CANONICAL_UNKNOWN: usize = usize::MAX;
+    const CANONICAL_MISSING: usize = usize::MAX - 1;
 
     fn resolve_canonical(
         idx: usize,
         entries: &[EntryTmp],
-        memo: &mut [CanonicalResolution],
+        memo: &mut [usize],
         visiting: &mut [bool],
     ) -> Option<usize> {
-        match memo[idx] {
-            CanonicalResolution::Found(canonical) => return Some(canonical),
-            CanonicalResolution::Missing => return None,
-            CanonicalResolution::Unknown => {}
+        if memo[idx] == CANONICAL_MISSING {
+            return None;
+        }
+        if memo[idx] != CANONICAL_UNKNOWN {
+            return Some(memo[idx]);
         }
         if visiting[idx] {
-            memo[idx] = CanonicalResolution::Missing;
+            memo[idx] = CANONICAL_MISSING;
             return None;
         }
         visiting[idx] = true;
@@ -994,47 +1282,46 @@ fn decode_chain_index<R: Read + Seek>(
             EntryTmp::Empty | EntryTmp::Alias { .. } => None,
         };
         visiting[idx] = false;
-        memo[idx] = result.map_or(CanonicalResolution::Missing, CanonicalResolution::Found);
+        memo[idx] = result.unwrap_or(CANONICAL_MISSING);
         result
     }
 
     let mut canonical = Vec::new();
     if has_aliases {
-        canonical.resize(entries.len(), CanonicalResolution::Unknown);
+        canonical.resize(entries.len(), CANONICAL_UNKNOWN);
         let mut visiting = vec![false; entries.len()];
         for idx in 0..entries.len() {
-            if matches!(entries[idx], EntryTmp::Alias { .. }) {
-                let _ = resolve_canonical(idx, &entries, &mut canonical, &mut visiting);
+            let EntryTmp::Alias { target } = entries[idx] else {
+                continue;
+            };
+            if target < entries.len() && matches!(entries[target], EntryTmp::Data { .. }) {
+                canonical[idx] = target;
+                continue;
             }
+            let _ = resolve_canonical(idx, &entries, &mut canonical, &mut visiting);
         }
     }
 
     let mut slots = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
         match *entry {
-            EntryTmp::Data {
-                offset,
-                length: Some(length),
-            } => {
+            EntryTmp::Data { offset, length } => {
                 let absolute = chain_start
                     .checked_add(offset)
                     .ok_or_else(|| Error::invalid("chain offset overflow"))?;
                 slots.push(Some(ChainSlot {
                     offset: absolute,
                     length,
-                    alias_of: None,
+                    alias_handle: 0,
                 }));
             }
             EntryTmp::Alias { .. } => {
-                let CanonicalResolution::Found(canonical_idx) = canonical[idx] else {
+                let canonical_idx = canonical[idx];
+                if canonical_idx >= entries.len() {
                     slots.push(None);
                     continue;
-                };
-                let EntryTmp::Data {
-                    offset,
-                    length: Some(length),
-                } = entries[canonical_idx]
-                else {
+                }
+                let EntryTmp::Data { offset, length } = entries[canonical_idx] else {
                     slots.push(None);
                     continue;
                 };
@@ -1046,12 +1333,38 @@ fn decode_chain_index<R: Read + Seek>(
                 slots.push(Some(ChainSlot {
                     offset: absolute,
                     length,
-                    alias_of: Some(alias_of),
+                    alias_handle: alias_of,
                 }));
             }
-            EntryTmp::Empty | EntryTmp::Data { length: None, .. } => slots.push(None),
+            EntryTmp::Empty => slots.push(None),
         }
     }
 
-    Ok(ChainIndex { slots })
+    Ok(ChainIndex::dense(slots))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_selected_dyn_alias2;
+    use crate::encoding::{encode_svarint, encode_varint};
+
+    #[test]
+    fn selected_dyn_alias2_resolves_alias_repeats_and_empty_runs() {
+        let mut index = Vec::new();
+        for value in [3, -1, 1] {
+            encode_svarint(value, &mut index);
+        }
+        encode_varint(4, &mut index);
+
+        let scan = scan_selected_dyn_alias2(&index, 5, 8, &[2, 3, 4]).unwrap();
+        assert_eq!(scan.selected, [(2, 1), (3, 1), (4, 0)]);
+        assert_eq!(scan.data_offsets, [(1, 0)]);
+    }
+
+    #[test]
+    fn selected_dyn_alias2_rejects_forward_aliases() {
+        let mut index = Vec::new();
+        encode_svarint(-3, &mut index);
+        assert!(scan_selected_dyn_alias2(&index, 1, 0, &[1]).is_err());
+    }
 }

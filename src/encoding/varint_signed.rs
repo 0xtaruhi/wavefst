@@ -1,3 +1,4 @@
+#[cfg(any(feature = "reader", test))]
 use crate::error::{Error, Result};
 
 /// Encodes a signed integer using the signed LEB128 representation used by libfst.
@@ -18,32 +19,50 @@ pub fn encode_svarint(mut value: i64, out: &mut Vec<u8>) -> usize {
     out.len() - start
 }
 
-/// Decodes a signed LEB128 integer.
-pub fn decode_svarint(input: &mut &[u8]) -> Result<i64> {
-    let mut value = 0i128;
-    let mut shift = 0u32;
-    for _ in 0..10 {
-        let Some((&byte, rest)) = input.split_first() else {
+/// Decodes signed LEB128 without mutating the input and returns the encoded length.
+#[inline]
+#[cfg(any(feature = "reader", test))]
+pub(crate) fn decode_svarint_with_len(input: &[u8]) -> Result<(i64, usize)> {
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    for index in 0..10 {
+        let Some(&byte) = input.get(index) else {
             return Err(Error::decode(
                 "unexpected end of input while decoding signed varint",
             ));
         };
-        *input = rest;
-        value |= i128::from(byte & 0x7f) << shift;
+        if index == 9 {
+            if byte & 0x80 != 0 {
+                return Err(Error::decode("signed varint exceeds maximum length"));
+            }
+            if byte != 0 && byte != 0x7f {
+                return Err(Error::decode("signed varint overflows i64"));
+            }
+            value |= u64::from(byte & 1) << 63;
+            return Ok((value as i64, 10));
+        }
+
+        value |= u64::from(byte & 0x7f) << shift;
         shift += 7;
         if byte & 0x80 == 0 {
             if byte & 0x40 != 0 {
-                value |= (!0i128) << shift;
+                value |= (!0_u64) << shift;
             }
-            return i64::try_from(value).map_err(|_| Error::decode("signed varint overflows i64"));
+            return Ok((value as i64, index + 1));
         }
     }
-    Err(Error::decode("signed varint exceeds maximum length"))
+    unreachable!()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_svarint, encode_svarint};
+    use super::{decode_svarint_with_len, encode_svarint};
+
+    fn decode_svarint(input: &mut &[u8]) -> crate::Result<i64> {
+        let (value, consumed) = decode_svarint_with_len(input)?;
+        *input = &input[consumed..];
+        Ok(value)
+    }
 
     #[test]
     fn matches_signed_leb128_vectors() {

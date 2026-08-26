@@ -4,8 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-27
+
+### Added
+
+- Added independent `reader` and `writer` Cargo features, plus `async-read` and `async-write`
+  front ends with the former `async` feature retained as a compatibility alias.
+- Added `CodecParallelism::{Serial, Auto, Threads}` and reader/writer builder controls so thread
+  creation and worker counts are explicit runtime choices.
+- Added a reproducible 500k-signal selective-access benchmark covering random signal subsets,
+  1% time windows, viewport dragging, cold/warm cache states, wavefst 0.2.2, fst-reader 0.17,
+  libfst, and Wellen `load_signals`, with wall time, I/O bytes, peak RSS, and CPU-cycle metrics.
+- Added reusable reader queries through `set_included_handles`, `include_all_handles`,
+  `set_time_range`, and `rewind_value_changes`, retaining parsed metadata across viewports.
+
 ### Changed
 
+- Disabled `parallel` and `mmap` in the default feature set. Both remain opt-in capabilities;
+  codec execution stays serial even when `parallel` is compiled until a builder selects otherwise.
+- Made writer-only AHash and SIMD dependencies conditional, and made mmap, serde, and async
+  features imply only the front-end they actually require.
 - Replaced the former commercial-use restriction with the standard MIT License and declared the
   package using the SPDX `MIT` identifier.
 - Expanded reproducible performance coverage and README results across dense, wide, long, full,
@@ -13,6 +31,10 @@ All notable changes to this project are documented in this file.
 - Reduced reader fixed costs with buffered in-memory backtracking, optional hierarchy loading,
   reusable thread-local libdeflate decoders, compact selected-chain staging, and an alias-free
   chain-index fast path.
+- Replaced dense selected-handle indexes and alias maps with compact representations, added a
+  validated single-pass dynamic-alias scanner, and tuned random-seek buffering. On the checked-in
+  500k-signal workload this makes current wavefst faster than pinned libfst in A–E while using
+  about 9–10MiB peak RSS for sparse cases.
 
 ## 0.2.2 - 2026-08-26
 

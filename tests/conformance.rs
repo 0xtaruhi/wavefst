@@ -1,4 +1,8 @@
-#![cfg(any(feature = "gzip", feature = "lz4"))]
+#![cfg(all(
+    feature = "reader",
+    feature = "writer",
+    any(feature = "gzip", feature = "lz4")
+))]
 
 use std::io::Cursor;
 
@@ -322,43 +326,82 @@ fn binary_batch_fast_path_matches_regular_changes() -> wavefst::Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "gzip", feature = "parallel"))]
+#[cfg(all(feature = "gzip", feature = "lz4", feature = "parallel"))]
 #[test]
-fn bounded_parallel_codec_pool_round_trips_many_chains() -> wavefst::Result<()> {
+fn explicit_parallel_codec_pool_round_trips_zlib_and_lz4_chains() -> wavefst::Result<()> {
     const SIGNALS: usize = 64;
-    const STEPS: usize = 1_024;
+    const STEPS: usize = 2_048;
 
-    let mut writer = FstWriter::builder(Cursor::new(Vec::new()))
-        .chain_compression(ChainCompression::Zlib)
-        .time_compression(TimeCompression::Zlib)
-        .build()?;
-    writer.begin_scope(ScopeType::VcdModule, "parallel", None)?;
-    let mut batch = Vec::with_capacity(SIGNALS);
-    for signal in 0..SIGNALS {
-        let handle = writer.add_variable(
-            VarType::VcdWire,
-            VarDir::Implicit,
-            format!("s{signal}"),
-            GeomEntry::Fixed(1),
-        )?;
-        batch.push((handle, false));
-    }
-    writer.end_scope()?;
-    writer.write_header(Header::default())?;
+    use std::num::NonZeroUsize;
+    use wavefst::CodecParallelism;
 
-    for step in 0..STEPS {
-        for (signal, (_, value)) in batch.iter_mut().enumerate() {
-            *value = (signal + step) & 1 != 0;
+    let parallelism =
+        CodecParallelism::Threads(NonZeroUsize::new(2).expect("non-zero worker count"));
+    for compression in [ChainCompression::Zlib, ChainCompression::Lz4] {
+        let mut writer = FstWriter::builder(Cursor::new(Vec::new()))
+            .codec_parallelism(parallelism)
+            .chain_compression(compression)
+            .time_compression(TimeCompression::Zlib)
+            .build()?;
+        writer.begin_scope(ScopeType::VcdModule, "parallel", None)?;
+        let mut batch = Vec::with_capacity(SIGNALS);
+        for signal in 0..SIGNALS {
+            let handle = writer.add_variable(
+                VarType::VcdWire,
+                VarDir::Implicit,
+                format!("s{signal}"),
+                GeomEntry::Fixed(1),
+            )?;
+            batch.push((handle, false));
         }
-        writer.emit_binary_batch(step as u64, &batch)?;
-    }
-    let bytes = writer.finish()?.into_inner();
+        writer.end_scope()?;
+        writer.write_header(Header::default())?;
 
-    let mut reader = ReaderBuilder::new(Cursor::new(bytes)).build()?;
-    let changes = reader.next_value_changes()?.expect("VC block");
-    let count = changes.try_fold_binary(0usize, |count, _, _, _, _| count + 1)?;
-    assert_eq!(count, SIGNALS * STEPS);
+        let mut states = (1..=SIGNALS)
+            .map(|signal| (signal as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .collect::<Vec<_>>();
+        for step in 0..STEPS {
+            for (signal, (_, value)) in batch.iter_mut().enumerate() {
+                let state = &mut states[signal];
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                *value = *state & 1 != 0;
+            }
+            writer.emit_binary_batch(step as u64, &batch)?;
+        }
+        let bytes = writer.finish()?.into_inner();
+
+        let mut reader = ReaderBuilder::new(Cursor::new(bytes))
+            .codec_parallelism(parallelism)
+            .build()?;
+        let changes = reader.next_value_changes()?.expect("VC block");
+        let count = changes.try_fold_binary(0usize, |count, _, _, _, _| count + 1)?;
+        assert_eq!(count, SIGNALS * STEPS);
+    }
     Ok(())
+}
+
+#[cfg(not(feature = "parallel"))]
+#[test]
+fn runtime_parallel_codec_policy_requires_the_cargo_feature() {
+    use wavefst::CodecParallelism;
+
+    let Err(writer_error) = FstWriter::builder(Cursor::new(Vec::new()))
+        .codec_parallelism(CodecParallelism::Auto)
+        .build()
+    else {
+        panic!("writer must reject unavailable parallel support");
+    };
+    assert!(writer_error.to_string().contains("`parallel` feature"));
+
+    let Err(reader_error) = ReaderBuilder::new(Cursor::new(Vec::<u8>::new()))
+        .codec_parallelism(CodecParallelism::Auto)
+        .build()
+    else {
+        panic!("reader must reject unavailable parallel support");
+    };
+    assert!(reader_error.to_string().contains("`parallel` feature"));
 }
 
 #[test]

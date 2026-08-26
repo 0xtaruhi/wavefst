@@ -37,7 +37,7 @@ if [[ "$(git -C "$libfstwriter_source" rev-parse HEAD)" != "$libfstwriter_revisi
 fi
 
 mkdir -p "$bench_dir"
-cargo build --quiet --release --no-default-features --features gzip,lz4 \
+cargo build --quiet --release --no-default-features --features writer,gzip,lz4 \
     --example writer_ecosystem_bench
 cc -std=c11 -O3 -D_GNU_SOURCE \
     -I"$libfst_source/src" \

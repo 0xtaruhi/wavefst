@@ -13,12 +13,12 @@ use crate::encoding::encode_varint;
 use crate::error::{Error, Result};
 use crate::io::{WriteSeek, WriterBackend};
 use crate::types::{
-    AggregatePackType, ArrayAttributeType, BlockType, EnumValueType, FstByteOrder,
-    HierarchyAttributeType, MiscAttributeType, PackType, ScopeType, SignalValue,
+    AggregatePackType, ArrayAttributeType, BlockType, CodecParallelism, EnumValueType,
+    FstByteOrder, HierarchyAttributeType, MiscAttributeType, PackType, ScopeType, SignalValue,
     SupplementalDataType, SupplementalVarType, VarDir, VarType,
 };
 #[cfg(feature = "parallel")]
-use crate::util::{codec_partition_len, in_codec_pool};
+use crate::util::{codec_partition_len, codec_pool};
 use ahash::RandomState;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -30,6 +30,8 @@ use rayon::prelude::*;
 /// Options controlling [`FstWriter`] behaviour.
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
+    /// Runtime policy for compressing independent value-change chains.
+    pub codec_parallelism: CodecParallelism,
     /// Base-10 exponent describing the timescale to encode inside the header.
     pub timescale_exponent: i8,
     /// Optional compression quality hint (algorithm specific).
@@ -101,6 +103,7 @@ impl Default for WriterOptions {
             HierarchyCompression::Raw
         };
         Self {
+            codec_parallelism: CodecParallelism::Serial,
             timescale_exponent: -9,
             compression_level: None,
             chain_compression,
@@ -133,6 +136,14 @@ impl<W: WriteSeek> WriterBuilder<W> {
     /// Overrides writer options wholesale.
     pub fn options(mut self, options: WriterOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Selects the runtime policy for independent chain compression jobs.
+    ///
+    /// Policies other than [`CodecParallelism::Serial`] require the `parallel` Cargo feature.
+    pub fn codec_parallelism(mut self, parallelism: CodecParallelism) -> Self {
+        self.options.codec_parallelism = parallelism;
         self
     }
 
@@ -200,6 +211,13 @@ fn validate_options(options: &WriterOptions) -> Result<()> {
     if options.block_change_limit == 0 || options.block_size_limit == 0 {
         return Err(Error::invalid(
             "writer block limits must be greater than zero",
+        ));
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    if !options.codec_parallelism.is_serial() {
+        return Err(Error::unsupported(
+            "parallel chain compression requires the `parallel` feature",
         ));
     }
 
@@ -1549,42 +1567,51 @@ impl<W: WriteSeek> FstWriter<W> {
             #[cfg(feature = "parallel")]
             let encoded_payloads: Option<Vec<(u64, Vec<u8>)>> = {
                 let canonical_bytes: usize = canonical_payloads.iter().map(|data| data.len()).sum();
-                if matches!(
-                    chain_compression,
-                    ChainCompression::Zlib | ChainCompression::FastLz
-                ) && canonical_payloads.len() >= 32
-                    && canonical_bytes >= 64 * 1024
+                let parallelism = self.options.codec_parallelism;
+                let parallel_codec = match parallelism {
+                    CodecParallelism::Serial => false,
+                    CodecParallelism::Auto => matches!(
+                        chain_compression,
+                        ChainCompression::Zlib | ChainCompression::FastLz
+                    ),
+                    CodecParallelism::Threads(_) => true,
+                };
+                if parallel_codec && canonical_payloads.len() >= 32 && canonical_bytes >= 64 * 1024
                 {
-                    let partition_len = codec_partition_len(canonical_payloads.len());
-                    #[cfg(feature = "gzip")]
-                    if chain_compression == ChainCompression::Zlib {
-                        Some(in_codec_pool(|| {
-                            canonical_payloads
-                                .par_iter()
-                                .with_min_len(partition_len)
-                                .map_init(
-                                    || ZlibChainEncoder::new(compression_level, max_chain_len),
-                                    |encoder, data| encoder.encode_owned(data),
-                                )
-                                .collect::<Result<_>>()
-                        })?)
-                    } else {
-                        Some(in_codec_pool(|| {
+                    let partition_len = codec_partition_len(canonical_payloads.len(), parallelism);
+                    if let Some(pool) = codec_pool(parallelism) {
+                        #[cfg(feature = "gzip")]
+                        if chain_compression == ChainCompression::Zlib {
+                            Some(pool.install(|| {
+                                canonical_payloads
+                                    .par_iter()
+                                    .with_min_len(partition_len)
+                                    .map_init(
+                                        || ZlibChainEncoder::new(compression_level, max_chain_len),
+                                        |encoder, data| encoder.encode_owned(data),
+                                    )
+                                    .collect::<Result<_>>()
+                            })?)
+                        } else {
+                            Some(pool.install(|| {
+                                canonical_payloads
+                                    .par_iter()
+                                    .with_min_len(partition_len)
+                                    .map(encode_payload)
+                                    .collect::<Result<_>>()
+                            })?)
+                        }
+                        #[cfg(not(feature = "gzip"))]
+                        Some(pool.install(|| {
                             canonical_payloads
                                 .par_iter()
                                 .with_min_len(partition_len)
                                 .map(encode_payload)
                                 .collect::<Result<_>>()
                         })?)
+                    } else {
+                        None
                     }
-                    #[cfg(not(feature = "gzip"))]
-                    Some(in_codec_pool(|| {
-                        canonical_payloads
-                            .par_iter()
-                            .with_min_len(partition_len)
-                            .map(encode_payload)
-                            .collect::<Result<_>>()
-                    })?)
                 } else {
                     None
                 }

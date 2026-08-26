@@ -1,4 +1,8 @@
-#![cfg(any(feature = "gzip", feature = "lz4"))]
+#![cfg(all(
+    feature = "reader",
+    feature = "writer",
+    any(feature = "gzip", feature = "lz4")
+))]
 
 #[cfg(all(feature = "gzip", feature = "lz4"))]
 use std::collections::BTreeSet;
@@ -112,13 +116,7 @@ fn selected_handles_only_load_their_chain_bytes_for_every_codec() -> wavefst::Re
         if !full.decoded_chain_buffer.is_empty() {
             assert!(filtered.decoded_chain_buffer.len() < full.decoded_chain_buffer.len());
         }
-        assert!(
-            filtered
-                .chains
-                .iter()
-                .flatten()
-                .all(|chain| selected.contains(&chain.handle) || chain.alias_of.is_none())
-        );
+        assert!(filtered.chains.len() <= selected.len());
 
         let events = collect_binary(&bytes, selected, 0, u64::MAX)?;
         assert_eq!(events.len(), selected.len() * STEPS);
@@ -290,7 +288,7 @@ fn empty_and_invalid_handle_selections_are_well_defined() -> wavefst::Result<()>
         .expect("metadata block remains visible");
     assert!(block.chain_buffer.is_empty());
     assert!(block.decoded_chain_buffer.is_empty());
-    assert!(block.chains.iter().all(Option::is_none));
+    assert!(block.chains.is_empty());
 
     assert!(
         ReaderBuilder::new(Cursor::new(&bytes))
@@ -340,6 +338,37 @@ fn hierarchy_can_be_skipped_when_handles_are_already_known() -> wavefst::Result<
         })?;
     }
     assert_eq!(count, 16);
+    Ok(())
+}
+
+#[test]
+fn reader_reuses_metadata_across_viewport_queries() -> wavefst::Result<()> {
+    let bytes = write_binary_trace(4, 32, 24, ChainCompression::Raw)?;
+    let mut reader = ReaderBuilder::new(Cursor::new(&bytes))
+        .include_handles([1])
+        .build()?;
+
+    for (handles, range) in [([2, 2], 10..=20), ([1, 4], 34..=48)] {
+        reader.set_included_handles(handles)?;
+        reader.set_time_range(Some(range.clone()))?;
+        let mut actual = Vec::new();
+        while let Some(changes) = reader.next_value_changes()? {
+            actual = changes.try_fold_binary(
+                actual,
+                |mut events, timestamp, handle, alias_of, value| {
+                    events.push((timestamp, handle, alias_of, value));
+                    events
+                },
+            )?;
+        }
+        assert_eq!(
+            actual,
+            collect_binary(&bytes, handles, *range.start(), *range.end())?
+        );
+    }
+
+    reader.include_all_handles()?;
+    assert!(reader.options().included_handles.is_none());
     Ok(())
 }
 

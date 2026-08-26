@@ -1,7 +1,15 @@
 //! I/O backends used by the reader and writer implementations.
 
-use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+#[cfg(feature = "writer")]
+use std::io::BufWriter;
+#[cfg(any(feature = "reader", feature = "writer"))]
+use std::io::Seek;
+#[cfg(feature = "writer")]
+use std::io::Write;
+#[cfg(feature = "reader")]
+use std::io::{self, BufReader, Cursor, Read, SeekFrom};
 
+#[cfg(feature = "writer")]
 use crate::error::{Error, Result};
 
 #[cfg(feature = "mmap")]
@@ -11,20 +19,25 @@ mod mmap;
 pub use mmap::MemoryMap;
 
 /// Convenience alias for a buffered reader usable by [`crate::ReaderBuilder`].
+#[cfg(feature = "reader")]
 pub type BufferedReader<R> = BufReader<R>;
 /// Convenience alias for a buffered writer usable by [`crate::WriterBuilder`].
+#[cfg(feature = "writer")]
 pub type BufferedWriter<W> = BufWriter<W>;
 
-const READER_BUFFER_CAPACITY: usize = 64 * 1024;
+#[cfg(feature = "reader")]
+const READER_BUFFER_CAPACITY: usize = 8 * 1024;
 
 /// Buffered input that keeps its logical position and satisfies seeks from buffered data when
 /// possible. FST blocks contain backward trailers and indexes, so this avoids needless kernel
 /// seeks on small and medium traces while retaining ordinary streaming behavior for large files.
+#[cfg(feature = "reader")]
 pub struct BufferedSeekReader<R> {
     inner: BufReader<R>,
     position: u64,
 }
 
+#[cfg(feature = "reader")]
 impl<R: Read> BufferedSeekReader<R> {
     fn new(inner: R) -> Self {
         Self {
@@ -38,6 +51,7 @@ impl<R: Read> BufferedSeekReader<R> {
     }
 }
 
+#[cfg(feature = "reader")]
 impl<R: Read> Read for BufferedSeekReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let count = self.inner.read(buffer)?;
@@ -49,6 +63,7 @@ impl<R: Read> Read for BufferedSeekReader<R> {
     }
 }
 
+#[cfg(feature = "reader")]
 impl<R: Read + Seek> Seek for BufferedSeekReader<R> {
     fn seek(&mut self, target: SeekFrom) -> io::Result<u64> {
         let absolute = match target {
@@ -77,15 +92,20 @@ impl<R: Read + Seek> Seek for BufferedSeekReader<R> {
 }
 
 /// Trait alias for objects that implement `Read + Seek`.
+#[cfg(feature = "reader")]
 pub trait ReadSeek: Read + Seek {}
+#[cfg(feature = "reader")]
 impl<T: Read + Seek> ReadSeek for T {}
 
 /// Trait alias for objects that implement `Write + Seek`.
+#[cfg(feature = "writer")]
 pub trait WriteSeek: Write + Seek {}
+#[cfg(feature = "writer")]
 impl<T: Write + Seek> WriteSeek for T {}
 
 /// Input retained by a reader. Wrapped FST files are decoded into memory while the original
 /// source is kept so [`ReaderBackend::into_inner`] remains lossless.
+#[cfg(feature = "reader")]
 pub enum ReaderInput<R> {
     /// Reads directly from the caller-provided source.
     Direct(R),
@@ -98,6 +118,7 @@ pub enum ReaderInput<R> {
     },
 }
 
+#[cfg(feature = "reader")]
 impl<R: Read + Seek> Read for ReaderInput<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -107,6 +128,7 @@ impl<R: Read + Seek> Read for ReaderInput<R> {
     }
 }
 
+#[cfg(feature = "reader")]
 impl<R: Read + Seek> Seek for ReaderInput<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
@@ -117,10 +139,12 @@ impl<R: Read + Seek> Seek for ReaderInput<R> {
 }
 
 /// Default buffered reader backend.
+#[cfg(feature = "reader")]
 pub struct ReaderBackend<R: ReadSeek> {
     inner: BufferedSeekReader<ReaderInput<R>>,
 }
 
+#[cfg(feature = "reader")]
 impl<R: ReadSeek> ReaderBackend<R> {
     /// Wraps a direct input in the default buffered backend.
     pub fn new(inner: R) -> Self {
@@ -153,10 +177,12 @@ impl<R: ReadSeek> ReaderBackend<R> {
 }
 
 /// Default buffered writer backend.
+#[cfg(feature = "writer")]
 pub struct WriterBackend<W: WriteSeek> {
     inner: BufWriter<W>,
 }
 
+#[cfg(feature = "writer")]
 impl<W: WriteSeek> WriterBackend<W> {
     /// Wraps an output in the default buffered backend.
     pub fn new(inner: W) -> Self {

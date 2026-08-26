@@ -435,6 +435,19 @@ dependencies = [
 
 [[package]]
 name = "wavefst"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f676d6a45d04173a2cd5c05ebd39913058a8d3910e2937079f8f811df70e189"
+dependencies = [
+ "ahash",
+ "libdeflater",
+ "lz4_flex 0.14.0",
+ "num_enum",
+ "thiserror",
+]
+
+[[package]]
+name = "wavefst"
 version = "0.3.0"
 dependencies = [
  "ahash",
@@ -445,11 +458,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavefst-ecosystem-bench"
+name = "wavefst-selective-bench"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "wavefst",
+ "fst-reader",
+ "libc",
+ "wavefst 0.2.2",
+ "wavefst 0.3.0",
  "wellen",
 ]
 

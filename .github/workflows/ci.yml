@@ -24,8 +24,12 @@ jobs:
           cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check selective benchmark formatting
+        run: cargo fmt --manifest-path benchmarks/selective/Cargo.toml -- --check
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Clippy (selective benchmark)
+        run: cargo clippy --manifest-path benchmarks/selective/Cargo.toml --all-targets -- -D warnings
       - name: Rustdoc (all features)
         env:
           RUSTDOCFLAGS: -D warnings
@@ -77,6 +81,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
       - name: Bidirectional libfst interoperability
         run: scripts/test-libfst-interop.sh
+      - name: Selective benchmark smoke test
+        env:
+          SIGNALS: 100
+          STEPS: 100
+          SAMPLES: 1
+          CASES: A D E
+          CACHE_MODES: G-warm
+          TRACE: target/selective-bench/ci-smoke.fst
+          RESULTS: target/selective-bench/ci-smoke.csv
+        run: scripts/bench-selective.sh
 
   feature-matrix:
     name: Feature matrix
@@ -87,9 +101,11 @@ jobs:
       matrix:
         features:
           - "--no-default-features"
-          - "--no-default-features --features gzip"
-          - "--no-default-features --features lz4"
-          - "--no-default-features --features parallel"
+          - "--no-default-features --features reader,gzip,lz4"
+          - "--no-default-features --features writer,gzip,lz4,simd"
+          - "--no-default-features --features reader,writer,gzip,lz4,parallel"
+          - "--no-default-features --features async-read,gzip,lz4"
+          - "--no-default-features --features async-write,gzip,lz4"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

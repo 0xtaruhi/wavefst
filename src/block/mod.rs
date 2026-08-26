@@ -14,7 +14,7 @@ pub use hier::{
     AttributeEntry, HierarchyBlock, HierarchyCompression, HierarchyItem, ScopeEntry, VarEntry,
 };
 pub use time::TimeSection;
-#[cfg(feature = "gzip")]
+#[cfg(all(feature = "gzip", feature = "writer"))]
 pub(crate) use vc::ZlibChainEncoder;
 pub use vc::{
     ChainIndexEntry, FrameEncoding, FrameSection, PackMarker, TimeEncoding, TimeTable, VcBlock,

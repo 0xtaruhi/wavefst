@@ -1,0 +1,17 @@
+[package]
+name = "wavefst-selective-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+fst-reader = "=0.17.0"
+libc = "0.2"
+wavefst-head = { package = "wavefst", path = "../..", default-features = false, features = ["reader", "writer", "gzip", "lz4"] }
+wavefst-022 = { package = "wavefst", version = "=0.2.2", default-features = false, features = ["gzip", "lz4"] }
+wellen = "=0.25.6"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

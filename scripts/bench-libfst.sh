@@ -30,7 +30,8 @@ if [[ "$actual_revision" != "$libfst_revision" ]]; then
 fi
 
 mkdir -p "$bench_dir"
-cargo build --quiet --release --no-default-features --features gzip --example libfst_bench
+cargo build --quiet --release --no-default-features --features reader,writer,gzip \
+    --example libfst_bench
 cc -std=c11 -O3 -D_GNU_SOURCE \
     -I"$libfst_source/src" \
     "$repo_root/tests/reference/libfst_bench.c" \

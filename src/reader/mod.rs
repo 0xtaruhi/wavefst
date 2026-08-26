@@ -8,7 +8,7 @@ use crate::block::{BlackoutBlock, GeomInfo, Header, HierarchyBlock};
 use crate::compression::gzip_decompress;
 use crate::error::{Error, Result};
 use crate::io::{ReadSeek, ReaderBackend};
-use crate::types::BlockType;
+use crate::types::{BlockType, CodecParallelism};
 use crate::util::{read_u64_be, skip_bytes};
 
 mod vc;
@@ -21,6 +21,8 @@ pub use change::{ValueChange, VcBlockChanges, build_changes};
 /// Controls how the [`FstReader`] parses data.
 #[derive(Debug, Clone)]
 pub struct ReaderOptions {
+    /// Runtime policy for decompressing independent value-change chains.
+    pub codec_parallelism: CodecParallelism,
     /// When `true`, geometry blocks are loaded eagerly as soon as they appear.
     pub eager_geometry: bool,
     /// When `true`, hierarchy blocks are decompressed and parsed.
@@ -41,6 +43,7 @@ pub struct ReaderOptions {
 impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
+            codec_parallelism: CodecParallelism::Serial,
             eager_geometry: true,
             load_hierarchy: true,
             max_decompressed_bytes: 8 * 1024 * 1024 * 1024,
@@ -71,6 +74,14 @@ impl<R: ReadSeek> ReaderBuilder<R> {
     /// Overrides reader options wholesale.
     pub fn options(mut self, options: ReaderOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Selects the runtime policy for independent chain decompression jobs.
+    ///
+    /// Policies other than [`CodecParallelism::Serial`] require the `parallel` Cargo feature.
+    pub fn codec_parallelism(mut self, parallelism: CodecParallelism) -> Self {
+        self.options.codec_parallelism = parallelism;
         self
     }
 
@@ -139,6 +150,7 @@ impl<R: ReadSeek> ReaderBuilder<R> {
 pub struct FstReader<R: ReadSeek> {
     backend: ReaderBackend<R>,
     options: ReaderOptions,
+    value_changes_start: u64,
     header: Header,
     geometry: Option<GeomInfo>,
     blackout: Option<BlackoutBlock>,
@@ -148,6 +160,12 @@ pub struct FstReader<R: ReadSeek> {
 
 impl<R: ReadSeek> FstReader<R> {
     fn with_backend(mut source: R, mut options: ReaderOptions) -> Result<Self> {
+        #[cfg(not(feature = "parallel"))]
+        if !options.codec_parallelism.is_serial() {
+            return Err(Error::unsupported(
+                "parallel chain decompression requires the `parallel` feature",
+            ));
+        }
         source.seek(SeekFrom::Start(0))?;
         let mut tag = [0u8; 1];
         source.read_exact(&mut tag)?;
@@ -167,36 +185,11 @@ impl<R: ReadSeek> FstReader<R> {
                 options.max_handles.min(u64::from(u32::MAX))
             )));
         }
-        if let Some(handles) = options.included_handles.as_mut() {
-            handles.sort_unstable();
-            handles.dedup();
-            if handles.first() == Some(&0) {
-                return Err(Error::invalid(
-                    "included handles are one-based; handle 0 is invalid",
-                ));
-            }
-            if handles
-                .last()
-                .is_some_and(|handle| u64::from(*handle) > header.max_handle)
-            {
-                return Err(Error::invalid(format!(
-                    "included handle {} exceeds the file's maximum handle {}",
-                    handles.last().expect("checked as present"),
-                    header.max_handle
-                )));
-            }
-        }
-        if header.max_handle != 0
-            && options
-                .included_handles
-                .as_ref()
-                .is_some_and(|handles| u64::try_from(handles.len()).ok() == Some(header.max_handle))
-        {
-            options.included_handles = None;
-        }
+        normalize_included_handles(&mut options.included_handles, header.max_handle)?;
         let mut reader = Self {
             backend,
             options,
+            value_changes_start: 0,
             header,
             geometry: None,
             blackout: None,
@@ -204,6 +197,7 @@ impl<R: ReadSeek> FstReader<R> {
             current_vc_block: None,
         };
         reader.parse_preamble()?;
+        reader.value_changes_start = reader.backend.get_mut().stream_position()?;
         Ok(reader)
     }
 
@@ -240,6 +234,45 @@ impl<R: ReadSeek> FstReader<R> {
     /// Returns a mutable reference to the underlying reader backend.
     pub fn raw_reader(&mut self) -> &mut ReaderBackend<R> {
         &mut self.backend
+    }
+
+    /// Rewinds to the first value-change block while retaining parsed file metadata.
+    ///
+    /// This is the low-cost foundation for repeated viewport queries. Any current block is
+    /// discarded, but geometry, hierarchy, blackout data, and the underlying open source are
+    /// reused.
+    pub fn rewind_value_changes(&mut self) -> Result<()> {
+        self.current_vc_block = None;
+        self.backend
+            .get_mut()
+            .seek(SeekFrom::Start(self.value_changes_start))?;
+        Ok(())
+    }
+
+    /// Replaces the signal selection and rewinds for a new query.
+    ///
+    /// Handles are one-based, sorted, and deduplicated. An empty iterator selects no signals.
+    pub fn set_included_handles<I>(&mut self, handles: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        self.options.included_handles = Some(handles.into_iter().collect());
+        normalize_included_handles(&mut self.options.included_handles, self.header.max_handle)?;
+        self.rewind_value_changes()
+    }
+
+    /// Selects every signal and rewinds for a new query.
+    pub fn include_all_handles(&mut self) -> Result<()> {
+        self.options.included_handles = None;
+        self.rewind_value_changes()
+    }
+
+    /// Replaces the inclusive timestamp filter and rewinds for a new query.
+    ///
+    /// Passing `None` selects the complete timeline.
+    pub fn set_time_range(&mut self, range: Option<RangeInclusive<u64>>) -> Result<()> {
+        self.options.time_range = range;
+        self.rewind_value_changes()
     }
 
     /// Consumes the reader, yielding the underlying I/O object.
@@ -306,6 +339,7 @@ impl<R: ReadSeek> FstReader<R> {
                             max_block_bytes: self.options.max_block_bytes,
                             max_handles: self.options.max_handles,
                             double_byte_order: self.header.double_byte_order,
+                            codec_parallelism: self.options.codec_parallelism,
                             included_handles: self.options.included_handles.as_deref(),
                             time_range: self.options.time_range.clone(),
                         },
@@ -583,4 +617,30 @@ fn validate_block_size(section_length: u64, limit: u64) -> Result<()> {
 #[inline]
 fn time_ranges_overlap(begin_time: u64, end_time: u64, range: &RangeInclusive<u64>) -> bool {
     range.start() <= range.end() && end_time >= *range.start() && begin_time <= *range.end()
+}
+
+fn normalize_included_handles(handles: &mut Option<Vec<u32>>, max_handle: u64) -> Result<()> {
+    let Some(selected) = handles.as_mut() else {
+        return Ok(());
+    };
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.first() == Some(&0) {
+        return Err(Error::invalid(
+            "included handles are one-based; handle 0 is invalid",
+        ));
+    }
+    if selected
+        .last()
+        .is_some_and(|handle| u64::from(*handle) > max_handle)
+    {
+        return Err(Error::invalid(format!(
+            "included handle {} exceeds the file's maximum handle {max_handle}",
+            selected.last().expect("checked as present")
+        )));
+    }
+    if max_handle != 0 && u64::try_from(selected.len()).ok() == Some(max_handle) {
+        *handles = None;
+    }
+    Ok(())
 }

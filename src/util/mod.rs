@@ -1,44 +1,64 @@
-use std::io::{Read, Seek, SeekFrom};
 #[cfg(feature = "parallel")]
-use std::sync::OnceLock;
-
-use crate::error::{Error, Result};
-
-/// Maximum number of independent codec partitions submitted to Rayon for a single FST block.
-/// More partitions increase work-stealing overhead sharply on many-core hosts because FST chains
-/// are usually small, independent codec streams.
+use std::collections::HashMap;
+use std::io::Read;
+#[cfg(feature = "reader")]
+use std::io::{Seek, SeekFrom};
 #[cfg(feature = "parallel")]
-pub(crate) const MAX_CODEC_TASKS: usize = 32;
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// Returns a Rayon minimum partition length that caps one block at [`MAX_CODEC_TASKS`] partitions.
+#[cfg(feature = "reader")]
+use crate::error::Error;
+use crate::error::Result;
 #[cfg(feature = "parallel")]
-#[inline]
-pub(crate) fn codec_partition_len(item_count: usize) -> usize {
-    item_count.div_ceil(MAX_CODEC_TASKS).max(1)
+use crate::types::CodecParallelism;
+
+/// Maximum worker count selected by [`CodecParallelism::Auto`]. Explicit thread counts remain
+/// under application control.
+#[cfg(feature = "parallel")]
+pub(crate) const MAX_AUTO_CODEC_THREADS: usize = 32;
+
+#[cfg(feature = "parallel")]
+fn codec_thread_count(parallelism: CodecParallelism) -> usize {
+    match parallelism {
+        CodecParallelism::Serial => 1,
+        CodecParallelism::Auto => std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_AUTO_CODEC_THREADS),
+        CodecParallelism::Threads(threads) => threads.get(),
+    }
 }
 
-/// Runs codec work on a bounded, lazily initialized pool. A separate pool prevents a machine's
-/// full global Rayon width from being awakened for the many short streams commonly found in one
-/// FST block. If pool construction fails, the operation safely falls back to the caller thread.
+/// Returns a Rayon minimum partition length matched to the selected codec worker count.
 #[cfg(feature = "parallel")]
-pub(crate) fn in_codec_pool<R, F>(operation: F) -> R
-where
-    R: Send,
-    F: FnOnce() -> R + Send,
-{
-    static CODEC_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    let pool = CODEC_POOL.get_or_init(|| {
-        let available = std::thread::available_parallelism().map_or(1, usize::from);
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(available.min(MAX_CODEC_TASKS))
-            .thread_name(|index| format!("wavefst-codec-{index}"))
-            .build()
-            .ok()
-    });
-    match pool {
-        Some(pool) => pool.install(operation),
-        None => operation(),
+#[inline]
+pub(crate) fn codec_partition_len(item_count: usize, parallelism: CodecParallelism) -> usize {
+    item_count
+        .div_ceil(codec_thread_count(parallelism).min(item_count).max(1))
+        .max(1)
+}
+
+/// Returns a lazily initialized private codec pool for the selected width. Failed constructions
+/// are cached so callers can fall back to their serial path without repeatedly allocating.
+#[cfg(feature = "parallel")]
+pub(crate) fn codec_pool(parallelism: CodecParallelism) -> Option<Arc<rayon::ThreadPool>> {
+    let threads = codec_thread_count(parallelism);
+    static CODEC_POOLS: OnceLock<Mutex<HashMap<usize, Option<Arc<rayon::ThreadPool>>>>> =
+        OnceLock::new();
+    let pools = CODEC_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut pools = pools
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pool) = pools.get(&threads) {
+        return pool.clone();
     }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(move |index| format!("wavefst-codec-{threads}-{index}"))
+        .build()
+        .ok()
+        .map(Arc::new);
+    pools.insert(threads, pool.clone());
+    pool
 }
 
 /// Reads an exact number of bytes into a fixed-size array.
@@ -65,6 +85,7 @@ pub(crate) fn read_cstring<R: Read>(reader: &mut R, len: usize) -> Result<String
 }
 
 /// Advances the reader by `len` bytes.
+#[cfg(feature = "reader")]
 #[inline]
 pub(crate) fn skip_bytes<R: Read + Seek>(reader: &mut R, len: u64) -> Result<()> {
     let offset = i64::try_from(len)
@@ -74,6 +95,7 @@ pub(crate) fn skip_bytes<R: Read + Seek>(reader: &mut R, len: u64) -> Result<()>
 }
 
 /// Reads a varint directly from a reader, returning the value and number of bytes consumed.
+#[cfg(feature = "reader")]
 pub(crate) fn read_varint_from_reader<R: Read>(reader: &mut R) -> Result<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0usize;

@@ -37,9 +37,9 @@ aliases, block checkpoints, static alias handles, and whole-file gzip wrappers.
 cargo add wavefst
 ```
 
-The default feature set enables libdeflate-backed gzip/zlib (`gzip`), LZ4 (`lz4`), memory mapping
-(`mmap`), parallel chain codecs (`parallel`), and the SSE2 packed-bit fast path (`simd`). Disable
-them with `--no-default-features` and opt back into the ones you need. The `gzip` feature builds the
+The default feature set enables the reader, writer, libdeflate-backed gzip/zlib (`gzip`), LZ4
+(`lz4`), and the SSE2 packed-bit writer path (`simd`). Memory mapping and parallel codecs are
+explicit opt-ins, so the default build never creates worker threads. The `gzip` feature builds the
 bundled libdeflate C library and therefore needs a working C compiler.
 
 ---
@@ -93,8 +93,28 @@ the original contiguous full-scan path. If handles are already known and signal 
 needed, add `.load_hierarchy(false)` to skip hierarchy decompression and parsing while retaining the
 geometry required to decode values.
 
+For a dragged viewport, keep the reader open and replace only its filters. `set_time_range`,
+`set_included_handles`, and `include_all_handles` rewind the value-change stream while retaining
+the parsed metadata and open source:
+
+```rust
+fn read_viewports(
+    reader: &mut wavefst::FstReader<std::fs::File>,
+) -> wavefst::Result<()> {
+    for window in [0..=99, 100..=199, 200..=299] {
+        reader.set_time_range(Some(window))?;
+        while let Some(changes) = reader.next_value_changes()? {
+            changes.try_for_each_parts(|time, handle, alias, value| {
+                std::hint::black_box((time, handle, alias, value));
+            })?;
+        }
+    }
+    Ok(())
+}
+```
+
 For handle-major analysis that does not require global timestamp ordering, use
-`try_for_each_parts_unordered`. With the default `parallel` feature, reductions can avoid shared
+`try_for_each_parts_unordered`. With the optional `parallel` feature, reductions can avoid shared
 atomics and locks through `try_fold_parts_parallel`. Strictly ordered reductions can keep their
 accumulator in registers with `try_fold_parts`; two-state bit traces have the specialized
 `try_fold_binary` path.
@@ -140,22 +160,29 @@ Dense binary simulators can submit one timestamp at a time with
 
 ## Feature Flags
 
-| Feature    | Default | Description                                                                  |
-|------------|:-------:|------------------------------------------------------------------------------|
-| `gzip`     | ✅      | Enable libdeflate-backed gzip hierarchy/wrapper and zlib VC compression.     |
-| `lz4`      | ✅      | Support LZ4-compressed hierarchy blocks and value-change chains.             |
-| `fastlz`   | ⛔️     | Add FastLZ decompression/compression for value-change chains.                |
-| `parallel` | ✅      | Use Rayon for large chain compression/decompression jobs.                    |
-| `serde`    | ⛔️     | Provide serialisable hierarchy and value-change snapshots (`serde_support`). |
-| `mmap`     | ✅      | Provide seekable, explicitly unsafe `io::MemoryMap` input for `ReaderBuilder`.|
-| `async`    | ⛔️     | Include buffered async wrappers (`async_support`) built on `tokio`.          |
-| `simd`     | ✅      | Use SSE2 to accelerate ASCII vector packing (falls back to scalar elsewhere).|
+| Feature       | Default | Description                                                                    |
+|---------------|:-------:|--------------------------------------------------------------------------------|
+| `reader`      | ✅      | Compile `FstReader`, selection, traversal, and reader I/O backends.             |
+| `writer`      | ✅      | Compile `FstWriter` and writer-only chain deduplication.                        |
+| `gzip`        | ✅      | Enable libdeflate-backed gzip hierarchy/wrapper and zlib VC compression.       |
+| `lz4`         | ✅      | Support LZ4-compressed hierarchy blocks and value-change chains.               |
+| `simd`        | ✅      | Use SSE2 to accelerate writer ASCII vector packing; implies `writer`.          |
+| `fastlz`      | ⛔️     | Add FastLZ decompression/compression for value-change chains.                  |
+| `parallel`    | ⛔️     | Compile Rayon codec/traversal support; runtime codec policy remains serial.    |
+| `mmap`        | ⛔️     | Provide `io::MemoryMap` input; implies `reader`.                               |
+| `async-read`  | ⛔️     | Provide the Tokio-backed `AsyncReader`; implies `reader`.                      |
+| `async-write` | ⛔️     | Provide the Tokio-backed `AsyncWriter`; implies `writer`.                      |
+| `async`       | ⛔️     | Compatibility alias enabling both `async-read` and `async-write`.              |
+| `serde`       | ⛔️     | Provide serialisable hierarchy/value-change snapshots; implies `reader`.       |
 
 Disable defaults with `--no-default-features` and enable the subset you need, for example:
 
 ```bash
-cargo add wavefst --no-default-features --features "gzip parallel"
+cargo add wavefst --no-default-features --features "reader gzip lz4"
 ```
+
+Features are additive. A pure writer can replace `reader` with `writer`; applications needing both
+can normally use the default feature set.
 
 ---
 
@@ -167,6 +194,58 @@ and optional FastLZ configurations:
 ```bash
 cargo bench
 ```
+
+For interactive waveform viewers, the repository also contains a separate 500,000-signal
+selective-access suite. It compares the current wavefst tree and wavefst 0.2.2 against
+fst-reader 0.17, libfst, and Wellen
+`load_signals` across random 10/100-signal selection, 1% time windows, a continuously dragged 1%
+viewport, and cold/warm page-cache states. Every sample records wall time, Linux storage and
+logical read bytes, peak RSS, CPU cycles, and the number of delivered changes:
+
+```bash
+BENCH_CPU=12 SAMPLES=3 scripts/bench-selective.sh
+```
+
+See [the selective benchmark protocol](benchmarks/selective/README.md) for exact semantics and
+measurement limitations. In particular, Wellen 0.25.6 does not expose a time-range argument to
+`load_signals`, and libfst emits block-frame values for some bounded queries; the harness reports
+those public-API costs instead of normalizing them away.
+
+### 500k-signal selective access
+
+The reference trace is 51,167,296 bytes and contains 500,000 one-bit signals, 100 timestamps, and
+50 million changes. A/B select 10/100 random signals, C reads the middle 1% of time, D combines 100
+signals with that 1% window, and E performs 100 consecutive 1%-wide viewport queries. Lower is
+better. Current wavefst values are three-sample medians; the pinned competitor columns are the
+checked-in diagnostic measurements described in the protocol.
+
+| Case | wavefst 0.3.0 | wavefst 0.2.2 | fst-reader 0.17 | libfst | Wellen 0.25.6 |
+|------|--------------:|--------------:|----------------:|-------:|--------------:|
+| A — 10 signals | **0.337 s** | 10.878 s | 0.697 s | 0.435 s | 1.160 s |
+| B — 100 signals | **0.348 s** | 11.101 s | 0.803 s | 0.444 s | 1.192 s |
+| C — 1% time | **0.048 s** | 0.287 s | 2.525 s | 0.524 s | 130.959 s |
+| D — 100 signals × 1% | **0.022 s** | 0.317 s | 0.024 s | 0.030 s | 1.215 s |
+| E — 100 viewports | **0.382 s** | 23.389 s | 0.805 s | 0.707 s | 1.206 s |
+
+The next table exposes the resource trade-offs against libfst instead of reporting latency alone.
+Cold reads are Linux `read_bytes`; RSS and cycles are from warm-cache runs. Wavefst leads latency,
+cycles, and sparse-case RSS, while libfst still reads fewer bytes for C/D and uses less memory for
+the all-signal C workload.
+
+| Case | Cold wall: wavefst / libfst | Cold read bytes: wavefst / libfst | Warm RSS KiB: wavefst / libfst | CPU cycles: wavefst / libfst |
+|------|----------------------------:|----------------------------------:|--------------------------------:|-----------------------------:|
+| A | **0.380 / 0.466 s** | 50,114,560 / **50,081,792** | **9,820 / 11,160** | **951M / 1,241M** |
+| B | **0.381 / 0.476 s** | 50,114,560 / **50,081,792** | **9,804 / 12,128** | **980M / 1,245M** |
+| C | **0.051 / 0.518 s** | 2,011,136 / **1,318,912** | 31,012 / **17,352** | **49M / 321M** |
+| D | **0.023 / 0.028 s** | 2,011,136 / **1,318,912** | **9,256 / 12,108** | **17M / 27M** |
+| E | **0.422 / 0.740 s** | 50,114,560 / **50,081,792** | **9,844 / 16,932** | **982M / 1,999M** |
+
+The exact current samples are in
+[`reference-results-wavefst-head-xeon-6148.csv`](benchmarks/selective/reference-results-wavefst-head-xeon-6148.csv),
+and the pinned cross-tool samples are in
+[`reference-results-xeon-6148.csv`](benchmarks/selective/reference-results-xeon-6148.csv).
+Absolute results depend on waveform shape, CPU, and filesystem, so the scripts and raw data—not
+rounded README numbers—are authoritative.
 
 The cross-tool numbers below were measured on an Intel Xeon Gold 6148 with one process pinned to
 CPU 12, Rust 1.98.0, and GCC 15.2.0. They are medians of five samples after warmup; every iteration
@@ -264,9 +343,27 @@ Sparse consumers should set `include_handles` before opening the value-change st
 decoding every chain and filtering callbacks afterward. It uses the FST chain index for direct
 payload reads and also handles dynamic aliases without emitting an unselected canonical signal.
 
-Large independent chain codecs use a lazily initialized pool capped at 32 workers, preventing
-many-core hosts from spending more time on Rayon work stealing than on short FST streams. Explicit
-parallel traversal APIs continue to use the application's global Rayon pool.
+The `parallel` Cargo feature only compiles parallel capability. Reader and writer builders remain
+serial until the application selects a runtime policy:
+
+```rust
+use std::num::NonZeroUsize;
+use wavefst::{CodecParallelism, ReaderBuilder};
+
+# fn configure(file: std::fs::File) -> wavefst::Result<()> {
+let reader = ReaderBuilder::new(file)
+    .codec_parallelism(CodecParallelism::Threads(
+        NonZeroUsize::new(4).expect("four is non-zero"),
+    ))
+    .build()?;
+# drop(reader);
+# Ok(())
+# }
+```
+
+`Auto` uses at most 32 workers, `Threads(n)` uses exactly the requested private pool width, and
+`Serial` is the default. Pools are created lazily and reused by width. Explicit parallel traversal
+APIs continue to use the application's global Rayon pool.
 
 Single-threaded raw-chain writing assembles the final block directly without per-chain staging
 buffers. Dynamic-chain deduplication uses a randomized fast hash while still comparing complete
@@ -280,8 +377,9 @@ kernel seeks. These optimizations do not change validation or the standard FST r
 
 ## Async, SIMD, and serde helpers
 
-- `wavefst::async_support::{AsyncReader, AsyncWriter}` buffer async sources/sinks using `tokio`
-  before delegating to the synchronous codecs. Useful when you cannot block the reactor thread.
+- `async-read` and `async-write` independently provide `AsyncReader` and `AsyncWriter`; `async`
+  enables both for compatibility. They buffer async sources/sinks using Tokio before delegating to
+  the synchronous codecs.
 - `wavefst::serde_support` (behind `serde`) snapshots hierarchy trees and value changes as owned data
   structures that plug directly into `serde_json`, CBOR, etc.
 - `simd` enables an SSE2 fast path for ASCII vector packing; non-x86 targets automatically use the
@@ -291,7 +389,7 @@ kernel seeks. These optimizations do not change validation or the standard FST r
 
 ## Tooling
 
-- **Tests** – `cargo test` (add `--features "async gzip serde simd"` to exercise optional paths).
+- **Tests** – `cargo test`; `cargo test --all-features` exercises every optional backend.
 - **Benches** – `cargo bench` compares reader/writer throughput across compression modes.
 - **libfst comparison** – `scripts/bench-libfst.sh` measures cross-format full and selective reads
   plus dense zlib writing against the pinned C reference.

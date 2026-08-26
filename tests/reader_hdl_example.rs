@@ -1,3 +1,5 @@
+#![cfg(feature = "reader")]
+
 use std::convert::TryInto;
 use std::fs::{File, read};
 use std::path::PathBuf;
