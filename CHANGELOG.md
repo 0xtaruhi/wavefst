@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Changed
+
+- Decode serial zlib value chains directly into their final arena, eliminating one allocation and
+  copy per compressed chain.
+- Inline the common one-byte varint decoder while keeping multi-byte validation in an outlined
+  slow path.
+
 ## 0.2.1 - 2026-08-26
 
 ### Added

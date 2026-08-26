@@ -50,11 +50,17 @@ pub fn decode_varint(input: &mut &[u8]) -> Result<u64> {
 /// Decodes a u64 varint from the provided byte slice, returning the value and bytes consumed.
 #[inline]
 pub fn decode_varint_with_len(input: &[u8]) -> Result<(u64, usize)> {
-    if let Some(&byte) = input.first()
-        && byte < 0x80
-    {
-        return Ok((u64::from(byte), 1));
+    match input.first().copied() {
+        Some(byte) if byte < 0x80 => Ok((u64::from(byte), 1)),
+        Some(_) => decode_varint_with_len_slow(input),
+        None => Err(Error::decode(
+            "unexpected end of input while decoding varint",
+        )),
     }
+}
+
+#[inline(never)]
+fn decode_varint_with_len_slow(input: &[u8]) -> Result<(u64, usize)> {
     let mut value = 0u64;
     for i in 0..VARINT_MAX_LEN {
         if i >= input.len() {

@@ -41,13 +41,22 @@ pub(crate) fn zlib_decompress_with(
     expected_len: usize,
 ) -> Result<Vec<u8>> {
     let mut output = vec![0_u8; expected_len];
+    zlib_decompress_into_with(decompressor, input, &mut output)?;
+    Ok(output)
+}
+
+pub(crate) fn zlib_decompress_into_with(
+    decompressor: &mut Decompressor,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
     let written = decompressor
-        .zlib_decompress(input, &mut output)
+        .zlib_decompress(input, output)
         .map_err(|error| Error::decode(format!("zlib decompression failed: {error}")))?;
-    if written != expected_len {
+    if written != output.len() {
         return Err(Error::decode("zlib decompressed length mismatch"));
     }
-    Ok(output)
+    Ok(())
 }
 
 pub(crate) fn gzip_decompress(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {

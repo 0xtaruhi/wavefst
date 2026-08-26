@@ -151,9 +151,9 @@ on an Intel Xeon Gold 6148 (Rust 1.98.0, GCC 15.2.0). Lower latency is better.
 
 | Operation and input | wavefst | libfst | wavefst relative |
 |---------------------|--------:|-------:|-----------------:|
-| Write implementation's own FST | 6.75 ms | 9.62 ms | 1.42× faster |
-| Read wavefst output | 2.56 ms | 2.80 ms | 1.10× faster |
-| Read libfst output | 2.51 ms | 2.75 ms | 1.10× faster |
+| Write implementation's own FST | 6.79 ms | 10.24 ms | 1.51× faster |
+| Read wavefst output | 2.27 ms | 2.76 ms | 1.21× faster |
+| Read libfst output | 2.16 ms | 2.68 ms | 1.24× faster |
 
 The resulting files were 29,333 bytes for wavefst and 29,651 bytes for libfst. The wavefst writer
 uses its public `emit_binary_batch` hot path; libfst has no equivalent batch call and uses
