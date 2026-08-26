@@ -1,6 +1,6 @@
 [package]
 name = "wavefst"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Modern Rust implementation of the Fast Signal Trace (FST) binary waveform format."
 authors = ["Zhengyi Zhang <zhang_zhengyi@outlook.com>"]

@@ -138,6 +138,32 @@ and optional FastLZ configurations. Run them on the target machine with:
 cargo bench
 ```
 
+### Comparison with libfst
+
+The repository also contains a cross-implementation benchmark using the pinned upstream libfst
+revision from the interoperability oracle. Both writers receive the same deterministic trace of
+512 one-bit signals over 128 timestamps (65,536 events). Both use zlib level 4 for value chains and
+level 9 for time tables; every read verifies the exact event count. Each reader is measured on both
+implementations' output so input layout cannot determine the result by itself.
+
+These are the medians of three runs with 50 warmups and 500 measured iterations, pinned to one CPU
+on an Intel Xeon Gold 6148 (Rust 1.98.0, GCC 15.2.0). Lower latency is better.
+
+| Operation and input | wavefst | libfst | wavefst relative |
+|---------------------|--------:|-------:|-----------------:|
+| Write implementation's own FST | 6.75 ms | 9.62 ms | 1.42× faster |
+| Read wavefst output | 2.56 ms | 2.80 ms | 1.10× faster |
+| Read libfst output | 2.51 ms | 2.75 ms | 1.10× faster |
+
+The resulting files were 29,333 bytes for wavefst and 29,651 bytes for libfst. The wavefst writer
+uses its public `emit_binary_batch` hot path; libfst has no equivalent batch call and uses
+`fstWriterEmitValueChange`. This is one dense binary workload, not a universal performance claim.
+Run the exact harness on the target machine with:
+
+```bash
+ITERATIONS=500 WARMUP=50 BENCH_CPU=12 scripts/bench-libfst.sh
+```
+
 The ordinary value-change iterator prioritises ergonomic per-event error handling. Hot paths can
 choose ordered `try_for_each_parts`, cache-friendly handle-major `try_for_each_parts_unordered`, or
 parallel thread-local `try_fold_parts_parallel`; ordered scalar reductions can use `try_fold_parts`
@@ -172,6 +198,8 @@ FST representation.
 
 - **Tests** – `cargo test` (add `--features "async gzip serde simd"` to exercise optional paths).
 - **Benches** – `cargo bench` compares reader/writer throughput across compression modes.
+- **libfst comparison** – `scripts/bench-libfst.sh` benchmarks both implementations on identical
+  dense data and verifies both cross-reader event counts.
 - **Interop fixture** – the checked-in `hdl-example.fst` event count is compared with the reference
   `fstReaderIterBlocks` result.
 - **Upstream oracle** – `scripts/test-libfst-interop.sh` compiles pinned libfst independently and

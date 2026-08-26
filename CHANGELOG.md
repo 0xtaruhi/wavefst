@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.2.1 - 2026-08-26
+
+### Added
+
+- Reproducible, single-core dense-trace performance comparison against the pinned upstream libfst
+  implementation, including cross-reader event-count validation and output-size reporting.
+
+### Changed
+
+- Replaced the flate2/zlib-rs gzip and zlib backend with bundled libdeflate across hierarchy,
+  geometry, frame, time-table, value-chain, and whole-file wrapper codecs.
+- Reused libdeflate compressor/decompressor state and scratch buffers across independent value
+  chains and Rayon partitions.
+
+### Fixed
+
+- Added gzip/zlib round-trip coverage at empty, small-chain, zlib-window, and declared-length
+  boundaries.
+
 ## 0.2.0 - 2026-08-26
 
 ### Added
