@@ -7,7 +7,7 @@ use std::io::Cursor;
 
 use anyhow::Result;
 #[cfg(feature = "gzip")]
-use flate2::read::GzDecoder;
+use libdeflater::Decompressor;
 use wavefst::encoding::decode_varint_with_len;
 use wavefst::{
     ChainCompression, FstWriter, GeomEntry, Header, PackType, ReaderBuilder, ScopeType,
@@ -549,8 +549,6 @@ fn writer_handles_alias_packed_real_and_varlen() -> Result<()> {
 #[cfg(feature = "gzip")]
 #[test]
 fn writer_wraps_with_zlib_envelope() -> Result<()> {
-    use std::io::Read;
-
     let sink = Cursor::new(Vec::new());
     let mut writer = FstWriter::builder(sink).wrap_with_zlib(true).build()?;
 
@@ -583,10 +581,10 @@ fn writer_wraps_with_zlib_envelope() -> Result<()> {
     assert_eq!(section_length as usize, bytes.len() - 1);
     assert!(uncompressed_len > 0);
 
-    let mut decoder = GzDecoder::new(&bytes[17..]);
-    let mut inner = Vec::new();
-    decoder.read_to_end(&mut inner)?;
-    assert_eq!(inner.len() as u64, uncompressed_len);
+    let mut decoder = Decompressor::new();
+    let mut inner = vec![0_u8; usize::try_from(uncompressed_len)?];
+    let written = decoder.gzip_decompress(&bytes[17..], &mut inner)?;
+    assert_eq!(written, inner.len());
 
     let mut reader = ReaderBuilder::new(Cursor::new(inner)).build()?;
     let mut iter = reader

@@ -4,6 +4,8 @@
 
 /// Block-level data structures mapping raw FST sections into typed records.
 pub mod block;
+#[cfg(feature = "gzip")]
+mod compression;
 /// Encoding helpers such as variable-length integer codecs.
 pub mod encoding;
 /// Shared error and result types.

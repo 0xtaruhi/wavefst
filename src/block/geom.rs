@@ -1,8 +1,7 @@
 use std::io::{Read, Write};
 
 #[cfg(feature = "gzip")]
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-
+use crate::compression::{zlib_compress, zlib_decompress};
 use crate::encoding::{decode_varint, encode_varint};
 use crate::error::{Error, Result};
 use crate::util::read_u64_be;
@@ -161,17 +160,7 @@ impl GeomInfo {
         } else {
             #[cfg(feature = "gzip")]
             {
-                let decoder = ZlibDecoder::new(&payload[..]);
-                let mut decoded = Vec::with_capacity(expected_uncompressed.min(16 * 1024 * 1024));
-                decoder
-                    .take(uncompressed_len.saturating_add(1))
-                    .read_to_end(&mut decoded)?;
-                if decoded.len() != expected_uncompressed {
-                    return Err(Error::decode(
-                        "geometry decompression length mismatch with header",
-                    ));
-                }
-                decoded
+                zlib_decompress(&payload, expected_uncompressed)?
             }
             #[cfg(not(feature = "gzip"))]
             {
@@ -228,9 +217,7 @@ impl GeomInfo {
         let (data, used_compression) = if compress {
             #[cfg(feature = "gzip")]
             {
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(4));
-                encoder.write_all(&raw)?;
-                let compressed = encoder.finish()?;
+                let compressed = zlib_compress(&raw, 4)?;
                 if compressed.len() < raw.len() {
                     (compressed, true)
                 } else {

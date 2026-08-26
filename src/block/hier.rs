@@ -1,14 +1,10 @@
 use std::io::{Read, Write};
 
-#[cfg(feature = "gzip")]
-use flate2::{
-    Compression,
-    read::{GzDecoder, ZlibDecoder},
-    write::GzEncoder,
-};
 #[cfg(feature = "lz4")]
 use lz4_flex::block::{compress as lz4_compress, decompress as lz4_decompress};
 
+#[cfg(feature = "gzip")]
+use crate::compression::{gzip_compress, gzip_decompress, zlib_decompress};
 use crate::encoding::{decode_varint_with_len, encode_varint};
 use crate::error::{Error, Result};
 use crate::types::{BlockType, ScopeType, VarDir, VarType};
@@ -211,9 +207,7 @@ impl HierarchyBlock {
                 {
                     // libfst names this block FST_BL_HIER, but its payload is a gzip member rather
                     // than a bare RFC 1950 zlib stream.
-                    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level.min(9)));
-                    encoder.write_all(&raw)?;
-                    let compressed = encoder.finish()?;
+                    let compressed = gzip_compress(&raw, level)?;
                     let section_length = compressed.len() as u64 + 16;
                     Ok(EncodedHierarchy {
                         block_type: BlockType::Hierarchy,
@@ -520,26 +514,12 @@ fn decode_zlib_maybe(payload: &[u8], expected: usize) -> Result<Vec<u8>> {
 
     #[cfg(feature = "gzip")]
     {
-        let mut decoded = Vec::with_capacity(expected.min(16 * 1024 * 1024));
-        let limit = u64::try_from(expected)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
         if payload.starts_with(&[0x1f, 0x8b]) {
-            GzDecoder::new(payload)
-                .take(limit)
-                .read_to_end(&mut decoded)?;
+            gzip_decompress(payload, expected)
         } else {
             // Compatibility with early wavefst versions that incorrectly used zlib here.
-            ZlibDecoder::new(payload)
-                .take(limit)
-                .read_to_end(&mut decoded)?;
+            zlib_decompress(payload, expected)
         }
-        if decoded.len() != expected {
-            return Err(Error::decode(
-                "hierarchy zlib decoding length mismatch with header",
-            ));
-        }
-        Ok(decoded)
     }
     #[cfg(not(feature = "gzip"))]
     {

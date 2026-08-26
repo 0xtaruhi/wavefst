@@ -35,9 +35,10 @@ aliases, block checkpoints, static alias handles, and whole-file gzip wrappers.
 cargo add wavefst
 ```
 
-The default feature set enables gzip/zlib (`gzip`), LZ4 (`lz4`), memory mapping (`mmap`), parallel
-chain codecs (`parallel`), and the SSE2 packed-bit fast path (`simd`). Disable them with
-`--no-default-features` and opt back into the ones you need.
+The default feature set enables libdeflate-backed gzip/zlib (`gzip`), LZ4 (`lz4`), memory mapping
+(`mmap`), parallel chain codecs (`parallel`), and the SSE2 packed-bit fast path (`simd`). Disable
+them with `--no-default-features` and opt back into the ones you need. The `gzip` feature builds the
+bundled libdeflate C library and therefore needs a working C compiler.
 
 ---
 
@@ -111,7 +112,7 @@ Dense binary simulators can submit one timestamp at a time with
 
 | Feature    | Default | Description                                                                  |
 |------------|:-------:|------------------------------------------------------------------------------|
-| `gzip`     | ✅      | Enable gzip hierarchy/wrapper and zlib VC compression.                       |
+| `gzip`     | ✅      | Enable libdeflate-backed gzip hierarchy/wrapper and zlib VC compression.     |
 | `lz4`      | ✅      | Support LZ4-compressed hierarchy blocks and value-change chains.             |
 | `fastlz`   | ⛔️     | Add FastLZ decompression/compression for value-change chains.                |
 | `parallel` | ✅      | Use Rayon for large chain compression/decompression jobs.                    |
@@ -151,9 +152,10 @@ Single-threaded raw-chain writing assembles the final block directly without per
 buffers. Dynamic-chain deduplication uses a randomized fast hash while still comparing complete
 chain bytes, so hash collisions cannot change alias correctness.
 
-Zlib value chains reuse encoder state and scratch storage within a block. The encoder selects the
-smallest standards-compliant window that can cover the longest chain, reducing short-chain setup
-cost without changing the compression level or FST representation.
+Gzip and zlib use bundled libdeflate through safe Rust bindings. Zlib value chains reuse compressor
+state and scratch storage within a block, while chain readers reuse decompressors within each
+serial or Rayon partition. This reduces setup and allocation cost without changing the standard
+FST representation.
 
 ## Async, SIMD, and serde helpers
 

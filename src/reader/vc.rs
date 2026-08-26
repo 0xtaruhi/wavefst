@@ -7,11 +7,13 @@ use rayon::prelude::*;
 #[cfg(feature = "fastlz")]
 use fastlz_sys::fastlz_decompress;
 #[cfg(feature = "gzip")]
-use flate2::read::ZlibDecoder;
+use libdeflater::Decompressor as LibdeflateDecompressor;
 #[cfg(feature = "lz4")]
 use lz4_flex::block::decompress as lz4_decompress;
 
 use crate::block::{FrameSection, PackMarker, TimeSection, TimeTable, VcBlock};
+#[cfg(feature = "gzip")]
+use crate::compression::zlib_decompress_with;
 use crate::encoding::{decode_svarint, decode_varint_with_len};
 use crate::error::{Error, Result};
 use crate::types::{BlockType, FstByteOrder, PackType};
@@ -361,10 +363,7 @@ fn build_chains(
         }
     }
 
-    let decompress = |job: ChainJob<'_>| -> Result<ChainJobResult> {
-        let expected = usize::try_from(job.stored_len)
-            .map_err(|_| Error::decode("chain stored length exceeds addressable memory"))?;
-        let data = decompress_chain_payload(pack_type, job.compressed, expected)?;
+    let finish_job = |job: ChainJob<'_>, data: Vec<u8>| -> Result<ChainJobResult> {
         let stored_len = u32::try_from(job.stored_len)
             .map_err(|_| Error::decode("chain stored length exceeds u32 range"))?;
         Ok(ChainJobResult {
@@ -374,14 +373,55 @@ fn build_chains(
             payload: data,
         })
     };
+    let decompress = |job: ChainJob<'_>| -> Result<ChainJobResult> {
+        let expected = usize::try_from(job.stored_len)
+            .map_err(|_| Error::decode("chain stored length exceeds addressable memory"))?;
+        let data = decompress_chain_payload(pack_type, job.compressed, expected)?;
+        finish_job(job, data)
+    };
+    #[cfg(feature = "gzip")]
+    let decompress_native =
+        |decoder: &mut LibdeflateDecompressor, job: ChainJob<'_>| -> Result<ChainJobResult> {
+            let expected = usize::try_from(job.stored_len)
+                .map_err(|_| Error::decode("chain stored length exceeds addressable memory"))?;
+            let data = zlib_decompress_with(decoder, job.compressed, expected)?;
+            finish_job(job, data)
+        };
 
     #[cfg(feature = "parallel")]
     let results: Vec<ChainJobResult> = {
         let decoded_bytes: u64 = jobs.iter().map(|job| job.stored_len).sum();
         if pack_type == PackType::Lz4 || jobs.len() < 32 || decoded_bytes < 64 * 1024 {
+            #[cfg(feature = "gzip")]
+            if pack_type == PackType::Zlib {
+                let mut decoder = LibdeflateDecompressor::new();
+                jobs.into_iter()
+                    .map(|job| decompress_native(&mut decoder, job))
+                    .collect::<Result<_>>()?
+            } else {
+                jobs.into_iter().map(decompress).collect::<Result<_>>()?
+            }
+            #[cfg(not(feature = "gzip"))]
             jobs.into_iter().map(decompress).collect::<Result<_>>()?
         } else {
             let partition_len = codec_partition_len(jobs.len());
+            #[cfg(feature = "gzip")]
+            if pack_type == PackType::Zlib {
+                in_codec_pool(|| {
+                    jobs.into_par_iter()
+                        .with_min_len(partition_len)
+                        .map_init(LibdeflateDecompressor::new, decompress_native)
+                        .collect::<Result<Vec<_>>>()
+                })?
+            } else {
+                in_codec_pool(|| {
+                    jobs.into_par_iter()
+                        .with_min_len(partition_len)
+                        .map(decompress)
+                        .collect::<Result<Vec<_>>>()
+                })?
+            }
+            #[cfg(not(feature = "gzip"))]
             in_codec_pool(|| {
                 jobs.into_par_iter()
                     .with_min_len(partition_len)
@@ -392,7 +432,19 @@ fn build_chains(
     };
 
     #[cfg(not(feature = "parallel"))]
-    let results: Vec<ChainJobResult> = jobs.into_iter().map(decompress).collect::<Result<_>>()?;
+    let results: Vec<ChainJobResult> = {
+        #[cfg(feature = "gzip")]
+        if pack_type == PackType::Zlib {
+            let mut decoder = LibdeflateDecompressor::new();
+            jobs.into_iter()
+                .map(|job| decompress_native(&mut decoder, job))
+                .collect::<Result<_>>()?
+        } else {
+            jobs.into_iter().map(decompress).collect::<Result<_>>()?
+        }
+        #[cfg(not(feature = "gzip"))]
+        jobs.into_iter().map(decompress).collect::<Result<_>>()?
+    };
 
     let decoded_capacity = results.iter().map(|result| result.payload.len()).sum();
     let mut decoded_arena = Vec::with_capacity(decoded_capacity);
@@ -455,16 +507,8 @@ fn decompress_chain_payload(
         PackType::Zlib => {
             #[cfg(feature = "gzip")]
             {
-                let decoder = ZlibDecoder::new(input);
-                let mut out = Vec::with_capacity(expected_len.min(16 * 1024 * 1024));
-                let limit = u64::try_from(expected_len)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                decoder.take(limit).read_to_end(&mut out)?;
-                if out.len() != expected_len {
-                    return Err(Error::decode("chain zlib length mismatch"));
-                }
-                Ok(out)
+                let mut decoder = LibdeflateDecompressor::new();
+                zlib_decompress_with(&mut decoder, input, expected_len)
             }
             #[cfg(not(feature = "gzip"))]
             {

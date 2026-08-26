@@ -2,10 +2,9 @@
 
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 
-#[cfg(feature = "gzip")]
-use flate2::read::GzDecoder;
-
 use crate::block::{BlackoutBlock, GeomInfo, Header, HierarchyBlock};
+#[cfg(feature = "gzip")]
+use crate::compression::gzip_decompress;
 use crate::error::{Error, Result};
 use crate::io::{ReadSeek, ReaderBackend};
 use crate::types::BlockType;
@@ -442,14 +441,7 @@ fn decode_wrapper<R: Read + Seek>(source: &mut R, max_decoded: u64) -> Result<Ve
 
     #[cfg(feature = "gzip")]
     {
-        let mut decoded = Vec::with_capacity(expected.min(16 * 1024 * 1024));
-        GzDecoder::new(compressed.as_slice())
-            .take(uncompressed_len.saturating_add(1))
-            .read_to_end(&mut decoded)?;
-        if decoded.len() != expected {
-            return Err(Error::decode("z-wrapper decompressed length mismatch"));
-        }
-        Ok(decoded)
+        gzip_decompress(&compressed, expected)
     }
     #[cfg(not(feature = "gzip"))]
     {

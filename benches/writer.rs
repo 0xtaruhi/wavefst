@@ -191,6 +191,26 @@ fn bench_writer(c: &mut Criterion) {
         );
     }
     group.finish();
+
+    #[cfg(feature = "gzip")]
+    {
+        let mut group = c.benchmark_group("writer_emit_binary_batch_zlib_level");
+        for level in [1, 4, 9] {
+            group.bench_with_input(BenchmarkId::from_parameter(level), &level, |b, &level| {
+                b.iter(|| {
+                    let mut writer = FstWriter::builder(Cursor::new(Vec::new()))
+                        .chain_compression(ChainCompression::Zlib)
+                        .time_compression(TimeCompression::Zlib)
+                        .compression_level(Some(level))
+                        .build()
+                        .unwrap();
+                    emit_dense_binary_trace(&mut writer);
+                    std::hint::black_box(writer.finish().unwrap().into_inner())
+                });
+            });
+        }
+        group.finish();
+    }
 }
 
 criterion_group!(benches, bench_writer);

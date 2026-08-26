@@ -7,6 +7,8 @@ use crate::block::{
     HierarchyBlock, HierarchyCompression, HierarchyItem, ScopeEntry, VarEntry, encode_chain_index,
     encode_chain_index_dyn_alias2, encode_chain_payload, encode_frame_section, encode_time_section,
 };
+#[cfg(feature = "gzip")]
+use crate::compression::gzip_compress;
 use crate::encoding::encode_varint;
 use crate::error::{Error, Result};
 use crate::io::{WriteSeek, WriterBackend};
@@ -22,8 +24,6 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
-#[cfg(feature = "gzip")]
-use flate2::{Compression, write::GzEncoder};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -365,14 +365,8 @@ impl<W: WriteSeek> OutputBackend<W> {
                 }
                 #[cfg(feature = "gzip")]
                 {
-                    let mut encoder = GzEncoder::new(
-                        Vec::new(),
-                        Compression::new(
-                            options.compression_level.map(|lvl| lvl.min(9)).unwrap_or(6),
-                        ),
-                    );
-                    encoder.write_all(&inner)?;
-                    let compressed = encoder.finish()?;
+                    let level = options.compression_level.map(|lvl| lvl.min(9)).unwrap_or(6);
+                    let compressed = gzip_compress(&inner, level)?;
                     let uncompressed_len = u64::try_from(inner.len()).map_err(|_| {
                         Error::invalid("z-wrapper uncompressed payload exceeds supported length")
                     })?;
