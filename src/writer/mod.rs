@@ -15,6 +15,7 @@ use crate::types::{
 };
 #[cfg(feature = "parallel")]
 use crate::util::{codec_partition_len, in_codec_pool};
+use ahash::RandomState;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{Cursor, Seek, SeekFrom, Write};
@@ -1479,7 +1480,10 @@ impl<W: WriteSeek> FstWriter<W> {
         let mut required_memory = 0u64;
         let mut chain_buffer = Vec::with_capacity(self.pending_bytes);
         let mut index_entries = Vec::with_capacity(self.pending_chains.len());
-        let mut canonical_chains: HashMap<&[u8], u32> = HashMap::new();
+        // AHash is randomized, and HashMap still compares complete slices: collisions cannot turn
+        // distinct value chains into aliases.
+        let mut canonical_chains: HashMap<&[u8], u32, RandomState> =
+            HashMap::with_capacity_and_hasher(self.pending_chains.len(), RandomState::new());
         let mut canonical_payloads = Vec::new();
         let mut has_dynamic_aliases = false;
 
@@ -1509,57 +1513,67 @@ impl<W: WriteSeek> FstWriter<W> {
         }
 
         let chain_compression = self.options.chain_compression;
-        let compression_level = self.options.compression_level;
-        let encode_payload = |data: &&[u8]| -> Result<(u64, Vec<u8>)> {
-            let data = *data;
-            if chain_compression == ChainCompression::Raw {
-                Ok((0, data.to_vec()))
-            } else {
+        if chain_compression == ChainCompression::Raw {
+            let mut canonical_payloads = canonical_payloads.into_iter();
+            for entry in &mut index_entries {
+                if let ChainIndexEntry::Data { offset } = entry {
+                    let payload = canonical_payloads
+                        .next()
+                        .ok_or_else(|| Error::invalid("missing raw chain payload"))?;
+                    *offset = u64::try_from(chain_buffer.len())
+                        .map_err(|_| Error::invalid("chain buffer exceeds u64 range"))?;
+                    encode_varint(0, &mut chain_buffer);
+                    chain_buffer.extend_from_slice(payload);
+                }
+            }
+        } else {
+            let compression_level = self.options.compression_level;
+            let encode_payload = |data: &&[u8]| -> Result<(u64, Vec<u8>)> {
                 encode_chain_payload(pack_type, data, compression_level)
-            }
-        };
+            };
 
-        #[cfg(feature = "parallel")]
-        let encoded_payloads: Vec<(u64, Vec<u8>)> = {
-            let canonical_bytes: usize = canonical_payloads.iter().map(|data| data.len()).sum();
-            if matches!(
-                chain_compression,
-                ChainCompression::Zlib | ChainCompression::FastLz
-            ) && canonical_payloads.len() >= 32
-                && canonical_bytes >= 64 * 1024
-            {
-                let partition_len = codec_partition_len(canonical_payloads.len());
-                in_codec_pool(|| {
+            #[cfg(feature = "parallel")]
+            let encoded_payloads: Vec<(u64, Vec<u8>)> = {
+                let canonical_bytes: usize = canonical_payloads.iter().map(|data| data.len()).sum();
+                if matches!(
+                    chain_compression,
+                    ChainCompression::Zlib | ChainCompression::FastLz
+                ) && canonical_payloads.len() >= 32
+                    && canonical_bytes >= 64 * 1024
+                {
+                    let partition_len = codec_partition_len(canonical_payloads.len());
+                    in_codec_pool(|| {
+                        canonical_payloads
+                            .par_iter()
+                            .with_min_len(partition_len)
+                            .map(encode_payload)
+                            .collect::<Result<_>>()
+                    })?
+                } else {
                     canonical_payloads
-                        .par_iter()
-                        .with_min_len(partition_len)
+                        .iter()
                         .map(encode_payload)
-                        .collect::<Result<_>>()
-                })?
-            } else {
-                canonical_payloads
-                    .iter()
-                    .map(encode_payload)
-                    .collect::<Result<_>>()?
-            }
-        };
+                        .collect::<Result<_>>()?
+                }
+            };
 
-        #[cfg(not(feature = "parallel"))]
-        let encoded_payloads: Vec<(u64, Vec<u8>)> = canonical_payloads
-            .iter()
-            .map(encode_payload)
-            .collect::<Result<_>>()?;
+            #[cfg(not(feature = "parallel"))]
+            let encoded_payloads: Vec<(u64, Vec<u8>)> = canonical_payloads
+                .iter()
+                .map(encode_payload)
+                .collect::<Result<_>>()?;
 
-        let mut encoded_payloads = encoded_payloads.into_iter();
-        for entry in &mut index_entries {
-            if let ChainIndexEntry::Data { offset } = entry {
-                let (stored_len, payload_bytes) = encoded_payloads
-                    .next()
-                    .ok_or_else(|| Error::invalid("missing encoded chain payload"))?;
-                *offset = u64::try_from(chain_buffer.len())
-                    .map_err(|_| Error::invalid("chain buffer exceeds u64 range"))?;
-                encode_varint(stored_len, &mut chain_buffer);
-                chain_buffer.extend_from_slice(&payload_bytes);
+            let mut encoded_payloads = encoded_payloads.into_iter();
+            for entry in &mut index_entries {
+                if let ChainIndexEntry::Data { offset } = entry {
+                    let (stored_len, payload_bytes) = encoded_payloads
+                        .next()
+                        .ok_or_else(|| Error::invalid("missing encoded chain payload"))?;
+                    *offset = u64::try_from(chain_buffer.len())
+                        .map_err(|_| Error::invalid("chain buffer exceeds u64 range"))?;
+                    encode_varint(stored_len, &mut chain_buffer);
+                    chain_buffer.extend_from_slice(&payload_bytes);
+                }
             }
         }
 

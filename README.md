@@ -147,6 +147,10 @@ Large independent chain codecs use a lazily initialized pool capped at 32 worker
 many-core hosts from spending more time on Rayon work stealing than on short FST streams. Explicit
 parallel traversal APIs continue to use the application's global Rayon pool.
 
+Single-threaded raw-chain writing assembles the final block directly without per-chain staging
+buffers. Dynamic-chain deduplication uses a randomized fast hash while still comparing complete
+chain bytes, so hash collisions cannot change alias correctness.
+
 ## Async, SIMD, and serde helpers
 
 - `wavefst::async_support::{AsyncReader, AsyncWriter}` buffer async sources/sinks using `tokio`

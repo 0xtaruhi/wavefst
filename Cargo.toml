@@ -23,8 +23,9 @@ async = ["dep:tokio"]
 simd = []
 
 [dependencies]
-thiserror = "2.0"
+ahash = "0.8"
 num_enum = "0.7"
+thiserror = "2.0"
 
 flate2 = { version = "1", optional = true, default-features = false, features = ["zlib-rs"] }
 lz4_flex = { version = "0.14", optional = true }
