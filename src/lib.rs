@@ -17,7 +17,7 @@ mod compression;
 pub mod encoding;
 /// Shared error and result types.
 pub mod error;
-/// I/O backends (buffered and memory-mapped).
+/// Buffered I/O backends and reader/writer traits.
 pub mod io;
 /// Streaming reader front-end for FST files.
 #[cfg(feature = "reader")]

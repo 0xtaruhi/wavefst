@@ -6,13 +6,6 @@
 
 use std::io::Cursor;
 
-#[cfg(feature = "mmap")]
-use std::io::{Read, Seek, SeekFrom};
-
-#[cfg(feature = "mmap")]
-use tempfile::tempdir;
-#[cfg(feature = "mmap")]
-use wavefst::io::MemoryMap;
 use wavefst::{
     ChainCompression, FstByteOrder, FstWriter, GeomEntry, Header, ReaderBuilder, ScopeType,
     SignalValue, TimeCompression, VarDir, VarType,
@@ -212,27 +205,6 @@ fn real_values_follow_the_header_byte_order() -> wavefst::Result<()> {
         changes.next().expect("real event")?.value,
         SignalValue::Real(-1234.5)
     );
-    Ok(())
-}
-
-#[cfg(feature = "mmap")]
-#[test]
-fn memory_map_is_a_seekable_reader_backend() -> wavefst::Result<()> {
-    let (mut writer, handle) = one_bit_writer(100)?;
-    writer.write_header(Header::default())?;
-    writer.emit_change(3, handle, SignalValue::Bit('1'))?;
-    let bytes = writer.finish()?.into_inner();
-
-    let directory = tempdir()?;
-    let path = directory.path().join("mapped.fst");
-    std::fs::write(&path, bytes)?;
-    // SAFETY: the temporary file is immutable until the reader and mapping are dropped.
-    let mmap = unsafe { MemoryMap::open(&path)? };
-    let mut reader = ReaderBuilder::new(mmap).build()?;
-    let changes = reader.next_value_changes()?.expect("VC block");
-    let mut timestamp = None;
-    changes.try_for_each(|event| timestamp = Some(event.timestamp))?;
-    assert_eq!(timestamp, Some(3));
     Ok(())
 }
 
@@ -555,24 +527,5 @@ fn reader_limits_reject_valid_files_before_large_allocations() -> wavefst::Resul
             .build()
             .is_err()
     );
-    Ok(())
-}
-
-#[cfg(feature = "mmap")]
-#[test]
-fn memory_map_seek_rejects_out_of_bounds_positions() -> wavefst::Result<()> {
-    let directory = tempdir()?;
-    let path = directory.path().join("seek.bin");
-    std::fs::write(&path, b"abcd")?;
-    // SAFETY: the temporary file remains immutable while the mapping exists.
-    let mut mmap = unsafe { MemoryMap::open(&path)? };
-
-    assert_eq!(mmap.seek(SeekFrom::End(0))?, 4);
-    assert_eq!(mmap.seek(SeekFrom::Current(-2))?, 2);
-    let mut tail = [0u8; 2];
-    mmap.read_exact(&mut tail)?;
-    assert_eq!(&tail, b"cd");
-    assert!(mmap.seek(SeekFrom::Start(5)).is_err());
-    assert!(mmap.seek(SeekFrom::Current(-5)).is_err());
     Ok(())
 }
