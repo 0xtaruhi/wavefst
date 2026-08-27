@@ -219,29 +219,32 @@ signals with that 1% window, and E performs 100 consecutive 1%-wide viewport que
 better. Current wavefst values are three-sample medians; the pinned competitor columns are the
 checked-in diagnostic measurements described in the protocol.
 
-| Case | wavefst 0.3.0 | wavefst 0.2.2 | fst-reader 0.17 | libfst | Wellen 0.25.6 |
+| Case | wavefst current | wavefst 0.2.2 | fst-reader 0.17 | libfst | Wellen 0.25.6 |
 |------|--------------:|--------------:|----------------:|-------:|--------------:|
-| A — 10 signals | **0.337 s** | 10.878 s | 0.697 s | 0.435 s | 1.160 s |
-| B — 100 signals | **0.348 s** | 11.101 s | 0.803 s | 0.444 s | 1.192 s |
-| C — 1% time | **0.048 s** | 0.287 s | 2.525 s | 0.524 s | 130.959 s |
+| A — 10 signals | **0.365 s** | 10.878 s | 0.697 s | 0.435 s | 1.160 s |
+| B — 100 signals | **0.363 s** | 11.101 s | 0.803 s | 0.444 s | 1.192 s |
+| C — 1% time | **0.041 s** | 0.287 s | 2.525 s | 0.473 s | 130.959 s |
 | D — 100 signals × 1% | **0.022 s** | 0.317 s | 0.024 s | 0.030 s | 1.215 s |
-| E — 100 viewports | **0.382 s** | 23.389 s | 0.805 s | 0.707 s | 1.206 s |
+| E — 100 viewports | **0.398 s** | 23.389 s | 0.805 s | 0.707 s | 1.206 s |
 
 The next table exposes the resource trade-offs against libfst instead of reporting latency alone.
-Cold reads are Linux `read_bytes`; RSS and cycles are from warm-cache runs. Wavefst leads latency,
-cycles, and sparse-case RSS, while libfst still reads fewer bytes for C/D and uses less memory for
-the all-signal C workload.
+Cold reads are Linux `read_bytes`; RSS and cycles are from warm-cache runs. The current dense-index
+decoder removes the former C memory penalty, and the time-filtered seek buffer removes the former
+C/D read amplification. The paired C/D run used three samples per tool; D's cold-wall median varied
+in libfst's favour by 0.6 ms even though wavefst used fewer bytes and cycles.
 
 | Case | Cold wall: wavefst / libfst | Cold read bytes: wavefst / libfst | Warm RSS KiB: wavefst / libfst | CPU cycles: wavefst / libfst |
 |------|----------------------------:|----------------------------------:|--------------------------------:|-----------------------------:|
-| A | **0.380 / 0.466 s** | 50,114,560 / **50,081,792** | **9,820 / 11,160** | **951M / 1,241M** |
-| B | **0.381 / 0.476 s** | 50,114,560 / **50,081,792** | **9,804 / 12,128** | **980M / 1,245M** |
-| C | **0.051 / 0.518 s** | 2,011,136 / **1,318,912** | 31,012 / **17,352** | **49M / 321M** |
-| D | **0.023 / 0.028 s** | 2,011,136 / **1,318,912** | **9,256 / 12,108** | **17M / 27M** |
-| E | **0.422 / 0.740 s** | 50,114,560 / **50,081,792** | **9,844 / 16,932** | **982M / 1,999M** |
+| A | **0.419 / 0.466 s** | 50,114,560 / **50,081,792** | **9,776 / 11,160** | **1,034M / 1,241M** |
+| B | **0.413 / 0.476 s** | 50,114,560 / **50,081,792** | **9,860 / 12,128** | **1,036M / 1,245M** |
+| C | **0.037 / 0.468 s** | **1,269,760 / 1,318,912** | **17,232 / 17,392** | **45M / 319M** |
+| D | 0.0252 / **0.0246 s** | **1,269,760 / 1,318,912** | **9,352 / 12,072** | **17M / 27M** |
+| E | **0.447 / 0.740 s** | 50,114,560 / **50,081,792** | **9,864 / 16,932** | **1,046M / 1,999M** |
 
 The exact current samples are in
 [`reference-results-wavefst-head-xeon-6148.csv`](benchmarks/selective/reference-results-wavefst-head-xeon-6148.csv),
+the paired C/D samples are in
+[`reference-results-cd-paired-xeon-6148.csv`](benchmarks/selective/reference-results-cd-paired-xeon-6148.csv),
 and the pinned cross-tool samples are in
 [`reference-results-xeon-6148.csv`](benchmarks/selective/reference-results-xeon-6148.csv).
 Absolute results depend on waveform shape, CPU, and filesystem, so the scripts and raw data—not
@@ -371,9 +374,10 @@ chain bytes, so hash collisions cannot change alias correctness.
 
 Gzip and zlib use bundled libdeflate through safe Rust bindings. Zlib value chains reuse compressor
 state and scratch storage within a block, while chain readers reuse thread-local decompressors on
-serial paths and one decompressor per Rayon partition. The reader's 64 KiB seek-aware buffer also
-satisfies FST trailer/index backtracking from memory when possible instead of issuing redundant
-kernel seeks. These optimizations do not change validation or the standard FST representation.
+serial paths and one decompressor per Rayon partition. The reader uses an 8 KiB seek-aware buffer
+for sequential scans and a 1 KiB buffer for initially time-filtered scans, avoiding block-header
+read amplification while still satisfying nearby FST trailer/index backtracking from memory.
+These optimizations do not change validation or the standard FST representation.
 
 ## Async, SIMD, and serde helpers
 

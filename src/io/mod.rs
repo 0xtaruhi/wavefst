@@ -27,6 +27,9 @@ pub type BufferedWriter<W> = BufWriter<W>;
 
 #[cfg(feature = "reader")]
 const READER_BUFFER_CAPACITY: usize = 8 * 1024;
+/// Avoid reading whole filesystem pages twice when a time filter probes only block headers.
+#[cfg(feature = "reader")]
+pub(crate) const SEEK_READER_BUFFER_CAPACITY: usize = 1024;
 
 /// Buffered input that keeps its logical position and satisfies seeks from buffered data when
 /// possible. FST blocks contain backward trailers and indexes, so this avoids needless kernel
@@ -40,8 +43,12 @@ pub struct BufferedSeekReader<R> {
 #[cfg(feature = "reader")]
 impl<R: Read> BufferedSeekReader<R> {
     fn new(inner: R) -> Self {
+        Self::with_capacity(inner, READER_BUFFER_CAPACITY)
+    }
+
+    fn with_capacity(inner: R, capacity: usize) -> Self {
         Self {
-            inner: BufReader::with_capacity(READER_BUFFER_CAPACITY, inner),
+            inner: BufReader::with_capacity(capacity, inner),
             position: 0,
         }
     }
@@ -150,6 +157,12 @@ impl<R: ReadSeek> ReaderBackend<R> {
     pub fn new(inner: R) -> Self {
         Self {
             inner: BufferedSeekReader::new(ReaderInput::Direct(inner)),
+        }
+    }
+
+    pub(crate) fn with_capacity(inner: R, capacity: usize) -> Self {
+        Self {
+            inner: BufferedSeekReader::with_capacity(ReaderInput::Direct(inner), capacity),
         }
     }
 

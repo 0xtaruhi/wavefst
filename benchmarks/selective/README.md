@@ -82,7 +82,9 @@ space-separated subsets for focused reruns.
 
 The original pinned cross-tool diagnostic is checked in as
 [`reference-results-xeon-6148.csv`](reference-results-xeon-6148.csv); current wavefst's three-sample
-run is [`reference-results-wavefst-head-xeon-6148.csv`](reference-results-wavefst-head-xeon-6148.csv).
+run is [`reference-results-wavefst-head-xeon-6148.csv`](reference-results-wavefst-head-xeon-6148.csv),
+with paired post-optimization C/D samples in
+[`reference-results-cd-paired-xeon-6148.csv`](reference-results-cd-paired-xeon-6148.csv).
 They were measured on an Intel
 Xeon Gold 6148, CPU 12, Linux 5.15, Rust 1.98.0, GCC 15.2.0, and an ext4-backed 51,167,296-byte
 trace. The baseline columns below are the original single diagnostic sample; the current wavefst
@@ -91,16 +93,17 @@ claims. The warm-cache wall times were:
 
 | Case | wavefst current | wavefst 0.2.2 | fst-reader 0.17 | libfst | Wellen load_signals |
 |------|----------------:|--------------:|----------------:|-------:|--------------------:|
-| A | **0.337 s** | 10.878 s | 0.697 s | 0.435 s | 1.160 s |
-| B | **0.348 s** | 11.101 s | 0.803 s | 0.444 s | 1.192 s |
-| C | **0.048 s** | 0.287 s | 2.525 s | 0.524 s | 130.959 s |
+| A | **0.365 s** | 10.878 s | 0.697 s | 0.435 s | 1.160 s |
+| B | **0.363 s** | 11.101 s | 0.803 s | 0.444 s | 1.192 s |
+| C | **0.041 s** | 0.287 s | 2.525 s | 0.473 s | 130.959 s |
 | D | **0.022 s** | 0.317 s | 0.024 s | 0.030 s | 1.215 s |
-| E | **0.382 s** | 23.389 s | 0.805 s | 0.707 s | 1.206 s |
+| E | **0.398 s** | 23.389 s | 0.805 s | 0.707 s | 1.206 s |
 
-The raw CSV contains every requested metric. Current wavefst's cold-cache medians are 0.380s,
-0.381s, 0.051s, 0.023s, and 0.422s for A–E. It attributed 50,114,560 bytes for A/B/E and 2,011,136
-bytes for C/D; warm runs recorded zero `read_bytes`. Logical I/O exposes algorithmic amplification
-that cache state hides:
+The raw CSV contains every requested metric. Current wavefst's cold-cache medians are 0.419s,
+0.413s, 0.037s, 0.025s, and 0.447s for A–E. It attributed 50,114,560 bytes for A/B/E and 1,269,760
+bytes for C/D; warm runs recorded zero `read_bytes`. In the paired C/D run, libfst read 1,318,912
+bytes and reached 17,392 KiB RSS in C, versus wavefst's 17,232 KiB. Logical I/O exposes
+algorithmic amplification that cache state hides:
 fst-reader C issued 30.5 GiB and Wellen C 381.6 GiB of `rchar`. Wellen C also reached 580.7 MiB
 peak RSS. libfst reports twice as many C/D callbacks and 19,900 rather than 10,000 callbacks in E
 because it exposes block-frame values at bounded-range starts.

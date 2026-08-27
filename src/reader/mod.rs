@@ -7,7 +7,7 @@ use crate::block::{BlackoutBlock, GeomInfo, Header, HierarchyBlock};
 #[cfg(feature = "gzip")]
 use crate::compression::gzip_decompress;
 use crate::error::{Error, Result};
-use crate::io::{ReadSeek, ReaderBackend};
+use crate::io::{ReadSeek, ReaderBackend, SEEK_READER_BUFFER_CAPACITY};
 use crate::types::{BlockType, CodecParallelism};
 use crate::util::{read_u64_be, skip_bytes};
 
@@ -175,7 +175,11 @@ impl<R: ReadSeek> FstReader<R> {
             let decoded = decode_wrapper(&mut source, options.max_decompressed_bytes)?;
             ReaderBackend::wrapped(source, decoded)
         } else {
-            ReaderBackend::new(source)
+            if options.time_range.is_some() {
+                ReaderBackend::with_capacity(source, SEEK_READER_BUFFER_CAPACITY)
+            } else {
+                ReaderBackend::new(source)
+            }
         };
         let header = Header::read(backend.get_mut())?;
         if header.max_handle > options.max_handles || header.max_handle > u64::from(u32::MAX) {
