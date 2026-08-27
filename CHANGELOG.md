@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-27
+
 ### Changed
 
 - Shortened the project README and moved complete reproducible performance results and tuning
