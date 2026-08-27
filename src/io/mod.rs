@@ -12,12 +12,6 @@ use std::io::{self, BufReader, Cursor, Read, SeekFrom};
 #[cfg(feature = "writer")]
 use crate::error::{Error, Result};
 
-#[cfg(feature = "mmap")]
-mod mmap;
-
-#[cfg(feature = "mmap")]
-pub use mmap::MemoryMap;
-
 /// Convenience alias for a buffered reader usable by [`crate::ReaderBuilder`].
 #[cfg(feature = "reader")]
 pub type BufferedReader<R> = BufReader<R>;

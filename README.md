@@ -169,7 +169,6 @@ Dense binary simulators can submit one timestamp at a time with
 | `simd`        | ✅      | Use SSE2 to accelerate writer ASCII vector packing; implies `writer`.          |
 | `fastlz`      | ⛔️     | Add FastLZ decompression/compression for value-change chains.                  |
 | `parallel`    | ⛔️     | Compile Rayon codec/traversal support; runtime codec policy remains serial.    |
-| `mmap`        | ⛔️     | Provide `io::MemoryMap` input; implies `reader`.                               |
 | `async-read`  | ⛔️     | Provide the Tokio-backed `AsyncReader`; implies `reader`.                      |
 | `async-write` | ⛔️     | Provide the Tokio-backed `AsyncWriter`; implies `writer`.                      |
 | `async`       | ⛔️     | Compatibility alias enabling both `async-read` and `async-write`.              |
@@ -183,6 +182,17 @@ cargo add wavefst --no-default-features --features "reader gzip lz4"
 
 Features are additive. A pure writer can replace `reader` with `writer`; applications needing both
 can normally use the default feature set.
+
+Memory-mapping policy remains with the application. Since [`ReaderBuilder`] accepts any
+`Read + Seek` input, maps from crates such as `memmap2` can be passed without a wavefst feature by
+wrapping them in [`std::io::Cursor`]:
+
+```ignore
+let file = std::fs::File::open("trace.fst")?;
+// SAFETY: the application keeps the mapped file immutable while the map is alive.
+let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+let reader = wavefst::ReaderBuilder::new(std::io::Cursor::new(mmap)).build()?;
+```
 
 ---
 

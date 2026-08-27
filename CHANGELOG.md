@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Removed
+
+- Removed the optional `mmap` feature, `memmap2` dependency, and `io::MemoryMap` adapter. Callers
+  that choose memory mapping can pass `std::io::Cursor<memmap2::Mmap>` directly to `ReaderBuilder`.
+
 ## 0.3.0 - 2026-08-27
 
 ### Added
