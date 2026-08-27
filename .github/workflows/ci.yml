@@ -101,8 +101,6 @@ jobs:
     name: Upstream libfst oracle
     needs: lint
     runs-on: ubuntu-latest
-    env:
-      LIBFST_SOURCE: ${{ runner.temp }}/libfst-reference
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -112,9 +110,12 @@ jobs:
       - name: Install native codec dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
       - name: Bidirectional libfst interoperability
+        env:
+          LIBFST_SOURCE: ${{ runner.temp }}/libfst-reference
         run: scripts/test-libfst-interop.sh
       - name: Selective benchmark smoke test
         env:
+          LIBFST_SOURCE: ${{ runner.temp }}/libfst-reference
           SIGNALS: 100
           STEPS: 100
           SAMPLES: 1
