@@ -5,14 +5,44 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  pr-policy:
+    name: PR policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require an open linked issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            exit 0
+          fi
+          body=$(jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH")
+          issue_number=$(grep -Eio '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<< "$body" \
+            | head -n 1 | grep -Eo '[0-9]+' || true)
+          if [[ -z "$issue_number" ]]; then
+            echo "PR body must contain Closes, Fixes, or Resolves followed by #issue." >&2
+            exit 1
+          fi
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$issue_number")
+          if [[ $(jq -r 'has("pull_request") or .state != "open"' <<< "$issue") == "true" ]]; then
+            echo "#$issue_number must be an open issue in $GITHUB_REPOSITORY." >&2
+            exit 1
+          fi
+
   lint:
     name: Lint
+    needs: pr-policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,9 +110,12 @@ jobs:
       - name: Install native codec dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev
       - name: Bidirectional libfst interoperability
+        env:
+          LIBFST_SOURCE: ${{ runner.temp }}/libfst-reference
         run: scripts/test-libfst-interop.sh
       - name: Selective benchmark smoke test
         env:
+          LIBFST_SOURCE: ${{ runner.temp }}/libfst-reference
           SIGNALS: 100
           STEPS: 100
           SAMPLES: 1
@@ -114,3 +147,14 @@ jobs:
           cache-on-failure: true
       - name: Cargo test (${{ matrix.features }})
         run: cargo test --workspace ${{ matrix.features }}
+
+  required-gate:
+    name: Required gate
+    if: always()
+    needs: [pr-policy, lint, test, test-beta, libfst-interop, feature-matrix]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job to pass
+        env:
+          JOBS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$JOBS"
