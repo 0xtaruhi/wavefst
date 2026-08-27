@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Shortened the project README and moved complete reproducible performance results and tuning
+  guidance to `BENCHMARKS.md`.
+
 ### Removed
 
 - Removed the optional `mmap` feature, `memmap2` dependency, and `io::MemoryMap` adapter. Callers
